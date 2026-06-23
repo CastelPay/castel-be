@@ -1,2 +1,12 @@
 # deps
 node_modules/
+
+# env & secrets
+.env
+.env.*
+!.env.example
+
+# local db
+*.db
+*.db-*
+castel.db
