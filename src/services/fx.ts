@@ -12,14 +12,7 @@ export type Quote = {
   savingsIdr: number;
 };
 
-export async function quoteUsdcToCidr(usdc: number): Promise<Quote> {
-  const paths = await horizon
-    .strictSendPaths(USDC(), usdc.toFixed(7), [cIDR()])
-    .call();
-  const best = paths.records[0];
-  if (!best) throw new Error("no path USDC->cIDR (is the market seeded?)");
-
-  const cidrOut = Number(best.destination_amount);
+export function buildQuote(usdc: number, cidrOut: number): Quote {
   const changerRate = MID_RATE - MONEY_CHANGER_MARKDOWN;
   const changerCidr = usdc * changerRate;
   return {
@@ -30,6 +23,15 @@ export async function quoteUsdcToCidr(usdc: number): Promise<Quote> {
     changerCidr,
     savingsIdr: cidrOut - changerCidr,
   };
+}
+
+export async function quoteUsdcToCidr(usdc: number): Promise<Quote> {
+  const paths = await horizon
+    .strictSendPaths(USDC(), usdc.toFixed(7), [cIDR()])
+    .call();
+  const best = paths.records[0];
+  if (!best) throw new Error("no path USDC->cIDR (is the market seeded?)");
+  return buildQuote(usdc, Number(best.destination_amount));
 }
 
 export async function swapUsdcToCidr(userKp: Keypair, usdc: number, minRate = 16000) {

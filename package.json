@@ -1,7 +1,9 @@
 {
   "name": "castel-be",
   "scripts": {
-    "dev": "bun run --hot src/index.ts"
+    "dev": "bun run --hot src/index.ts",
+    "test": "bun test src/",
+    "test:integration": "bun run scripts/test-flow.ts && bun run scripts/test-cashout.ts"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^16.0.0",
