@@ -11,6 +11,16 @@ sqlite.run(`CREATE TABLE IF NOT EXISTS users (
   secret TEXT NOT NULL,
   created_at INTEGER NOT NULL
 )`);
+sqlite.run(`CREATE TABLE IF NOT EXISTS transactions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  wa_number TEXT NOT NULL,
+  type TEXT NOT NULL,
+  title TEXT NOT NULL,
+  amount_idr INTEGER NOT NULL,
+  direction TEXT NOT NULL,
+  hash TEXT,
+  created_at INTEGER NOT NULL
+)`);
 sqlite.run(`CREATE TABLE IF NOT EXISTS cashouts (
   escrow_id INTEGER PRIMARY KEY,
   wa_number TEXT NOT NULL,

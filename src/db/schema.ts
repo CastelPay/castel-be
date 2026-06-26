@@ -8,6 +8,17 @@ export const users = sqliteTable("users", {
   createdAt: integer("created_at").notNull(),
 });
 
+export const transactions = sqliteTable("transactions", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  waNumber: text("wa_number").notNull(),
+  type: text("type").notNull(),
+  title: text("title").notNull(),
+  amountIdr: integer("amount_idr").notNull(),
+  direction: text("direction").notNull(),
+  hash: text("hash"),
+  createdAt: integer("created_at").notNull(),
+});
+
 export const cashouts = sqliteTable("cashouts", {
   escrowId: integer("escrow_id").primaryKey(),
   waNumber: text("wa_number").notNull(),

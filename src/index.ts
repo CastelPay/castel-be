@@ -1,12 +1,12 @@
 import { Keypair, Operation } from "@stellar/stellar-sdk";
-import { eq } from "drizzle-orm";
+import { desc, eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { db } from "./db";
 import { cIDR, submit, USDC } from "./lib/stellar";
 import { parseQris } from "./lib/qris";
 import { escrowLock, escrowRelease, makePickup } from "./lib/soroban";
-import { cashouts, users } from "./db/schema";
+import { cashouts, transactions, users } from "./db/schema";
 import { createWallet, walletBalances } from "./services/custody";
 import { quoteUsdcToCidr, swapUsdcToCidr } from "./services/fx";
 
@@ -16,6 +16,24 @@ app.use("*", cors());
 
 const findUser = async (waNumber: string) =>
   (await db.select().from(users).where(eq(users.waNumber, waNumber)))[0];
+
+const recordTx = (
+  waNumber: string,
+  type: string,
+  title: string,
+  amountIdr: number,
+  direction: "in" | "out",
+  hash?: string,
+) =>
+  db.insert(transactions).values({
+    waNumber,
+    type,
+    title,
+    amountIdr: Math.round(amountIdr),
+    direction,
+    hash: hash ?? null,
+    createdAt: Date.now(),
+  });
 
 app.get("/", (c) => c.json({ ok: true, service: "castel-be" }));
 
@@ -65,8 +83,12 @@ app.post("/fx/swap", async (c) => {
   const { waNumber, usdc } = await c.req.json();
   const user = await findUser(waNumber);
   if (!user) return c.json({ error: "not found" }, 404);
+  const before = Number((await walletBalances(user.publicKey)).cIDR);
   const hash = await swapUsdcToCidr(Keypair.fromSecret(user.secret), Number(usdc));
-  return c.json({ hash, balances: await walletBalances(user.publicKey) });
+  const balances = await walletBalances(user.publicKey);
+  const received = Number(balances.cIDR) - before;
+  await recordTx(waNumber, "swap", `Exchanged ${usdc} USDC`, received, "in", hash);
+  return c.json({ hash, balances });
 });
 
 app.post("/qris/decode", async (c) => {
@@ -95,6 +117,8 @@ app.post("/pay", async (c) => {
     ),
   );
 
+  await recordTx(waNumber, "pay", info.merchantName, amountIdr, "out", res.hash);
+
   return c.json({
     merchant: info.merchantName,
     city: info.city,
@@ -114,7 +138,7 @@ app.post("/cashout/request", async (c) => {
   if (!amount || amount <= 0) return c.json({ error: "amount required" }, 400);
 
   const pickup = makePickup();
-  const { escrowId } = await escrowLock({
+  const { escrowId, hash } = await escrowLock({
     touristKp: Keypair.fromSecret(user.secret),
     amountCidr: amount,
     agentPub: process.env.AGENT_PUBLIC!,
@@ -122,6 +146,8 @@ app.post("/cashout/request", async (c) => {
     feeBps: CASHOUT_FEE_BPS,
     pickupHash: pickup.hash,
   });
+
+  await recordTx(waNumber, "cashout", "Cash withdrawal", amount, "out", hash);
 
   await db.insert(cashouts).values({
     escrowId,
@@ -166,6 +192,16 @@ app.post("/cashout/redeem", async (c) => {
 
   const fee = Math.round((row.amountIdr * CASHOUT_FEE_BPS) / 10000);
   return c.json({ escrowId: id, amountIdr: row.amountIdr, agentReceived: row.amountIdr - fee, fee });
+});
+
+app.get("/history/:waNumber", async (c) => {
+  const rows = await db
+    .select()
+    .from(transactions)
+    .where(eq(transactions.waNumber, c.req.param("waNumber")))
+    .orderBy(desc(transactions.createdAt))
+    .limit(15);
+  return c.json(rows);
 });
 
 export default { port: Number(process.env.PORT ?? 3001), fetch: app.fetch };
