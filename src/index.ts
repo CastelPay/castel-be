@@ -204,4 +204,76 @@ app.get("/history/:waNumber", async (c) => {
   return c.json(rows);
 });
 
+const fmt = (n: string | number) => new Intl.NumberFormat("id-ID").format(Math.round(Number(n)));
+const escapeXml = (s: string) =>
+  s.replace(/[<>&'"]/g, (ch) =>
+    ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", "'": "&apos;", '"': "&quot;" })[ch]!,
+  );
+
+async function internal(path: string, body?: unknown) {
+  const res = await app.fetch(
+    new Request("http://internal" + path, {
+      method: body ? "POST" : "GET",
+      headers: body ? { "content-type": "application/json" } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    }),
+  );
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { error: text || "request failed" };
+  }
+}
+
+async function botReply(waNumber: string, message: string): Promise<string> {
+  const t = message.trim().toLowerCase();
+  const web = process.env.WEB_WALLET_URL ?? "http://localhost:3000";
+  const link = (p: string) => `${web}${p}?wa=${encodeURIComponent(waNumber)}`;
+  const numIn = (s: string) => {
+    const m = s.match(/(\d[\d.,]*)/);
+    return m ? Number(m[1].replace(/[.,]/g, "")) : null;
+  };
+
+  await internal("/onboard", { waNumber });
+
+  if (t.startsWith("bal")) {
+    const b = await internal(`/balance/${encodeURIComponent(waNumber)}`);
+    return `💰 Your balance\nRupiah: Rp ${fmt(b.cIDR)}\nUSDC: ${Number(b.USDC).toFixed(2)}`;
+  }
+  if (t.startsWith("top")) {
+    const b = await internal("/fund", { waNumber, usdc: 200 });
+    return `✅ Topped up 200 USDC (demo).\nUSDC: ${Number(b.USDC).toFixed(2)}`;
+  }
+  if (t.startsWith("exchange") || t.startsWith("swap")) {
+    const usdc = numIn(t);
+    if (!usdc) return "How much USDC? e.g. *exchange 200*";
+    const q = await internal(`/fx/quote?usdc=${usdc}`);
+    const r = await internal("/fx/swap", { waNumber, usdc });
+    if (r.error) return `⚠️ Couldn't exchange — do you have ${usdc} USDC? Send *topup* first.`;
+    return `✅ Exchanged ${usdc} USDC → Rp ${fmt(q.cidrOut)}\n💰 You saved Rp ${fmt(q.savingsIdr)} vs money changers.\nBalance: Rp ${fmt(r.balances.cIDR)}`;
+  }
+  if (t.startsWith("pay")) {
+    return `📷 Tap to scan & pay a QRIS merchant:\n${link("/pay")}`;
+  }
+  if (t.startsWith("cash") || t.startsWith("withdraw")) {
+    return `💵 Tap to get cash at a Castel agent:\n${link("/cashout")}`;
+  }
+  return `👋 Welcome to *Castel* — fair-rate rupiah for Bali, no bank needed.\n\nTry:\n• *balance*\n• *topup* — add 200 USDC (demo)\n• *exchange 200* — swap to rupiah\n• *pay* — pay a QRIS merchant\n• *cash* — withdraw at an agent`;
+}
+
+app.post("/wa/webhook", async (c) => {
+  const form = await c.req.parseBody();
+  const from = String(form.From ?? "").replace("whatsapp:", "");
+  const body = String(form.Body ?? "");
+  let reply: string;
+  try {
+    reply = await botReply(from, body);
+  } catch (e) {
+    reply = "⚠️ Something went wrong: " + (e as Error).message;
+  }
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${escapeXml(reply)}</Message></Response>`;
+  return c.body(twiml, 200, { "content-type": "text/xml" });
+});
+
 export default { port: Number(process.env.PORT ?? 3001), fetch: app.fetch };
