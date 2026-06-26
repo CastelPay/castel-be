@@ -3,6 +3,7 @@
   "scripts": {
     "dev": "bun run --hot src/index.ts",
     "test": "bun test src/",
+    "test:e2e": "bun test e2e/",
     "test:integration": "bun run scripts/test-flow.ts && bun run scripts/test-cashout.ts"
   },
   "dependencies": {

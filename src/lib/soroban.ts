@@ -42,7 +42,7 @@ async function invoke(contractId: string, method: string, args: xdr.ScVal[], sig
     }
 
     let got = await soroban.getTransaction(sent.hash);
-    while (got.status === rpc.Api.GetTransactionStatus.NOT_FOUND) {
+    for (let polls = 0; got.status === rpc.Api.GetTransactionStatus.NOT_FOUND && polls < 30; polls++) {
       await sleep(1000);
       got = await soroban.getTransaction(sent.hash);
     }
@@ -67,21 +67,29 @@ export async function escrowLock(opts: {
   pickupHash: Buffer;
 }) {
   const stroops = BigInt(Math.round(opts.amountCidr)) * STROOPS;
-  const res = await invoke(
-    process.env.ESCROW_CONTRACT_ID!,
-    "lock",
-    [
-      addr(opts.touristKp.publicKey()),
-      addr(process.env.CIDR_SAC!),
-      nativeToScVal(stroops, { type: "i128" }),
-      addr(opts.agentPub),
-      addr(opts.platformPub),
-      nativeToScVal(opts.feeBps, { type: "u32" }),
-      nativeToScVal(opts.pickupHash, { type: "bytes" }),
-    ],
-    opts.touristKp,
-  );
-  return { escrowId: Number(res.value), hash: res.hash };
+  const args = [
+    addr(opts.touristKp.publicKey()),
+    addr(process.env.CIDR_SAC!),
+    nativeToScVal(stroops, { type: "i128" }),
+    addr(opts.agentPub),
+    addr(opts.platformPub),
+    nativeToScVal(opts.feeBps, { type: "u32" }),
+    nativeToScVal(opts.pickupHash, { type: "bytes" }),
+  ];
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const res = await invoke(process.env.ESCROW_CONTRACT_ID!, "lock", args, opts.touristKp);
+      return { escrowId: Number(res.value), hash: res.hash };
+    } catch (e) {
+      // Error(Contract, #10) = SAC balance not visible to simulation yet (RPC lag
+      // after a just-settled credit like a swap); retry.
+      if (attempt < 4 && (e as Error).message.includes("Contract, #10")) {
+        await sleep(3000);
+        continue;
+      }
+      throw e;
+    }
+  }
 }
 
 export async function escrowRelease(sourceKp: Keypair, escrowId: number, codeHex: string) {
