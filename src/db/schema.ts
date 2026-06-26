@@ -7,3 +7,12 @@ export const users = sqliteTable("users", {
   secret: text("secret").notNull(),
   createdAt: integer("created_at").notNull(),
 });
+
+export const cashouts = sqliteTable("cashouts", {
+  escrowId: integer("escrow_id").primaryKey(),
+  waNumber: text("wa_number").notNull(),
+  amountIdr: integer("amount_idr").notNull(),
+  codeHex: text("code_hex").notNull(),
+  status: text("status").notNull().default("pending"),
+  createdAt: integer("created_at").notNull(),
+});

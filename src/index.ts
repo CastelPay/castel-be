@@ -1,13 +1,18 @@
 import { Keypair, Operation } from "@stellar/stellar-sdk";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
+import { cors } from "hono/cors";
 import { db } from "./db";
-import { users } from "./db/schema";
-import { submit, USDC } from "./lib/stellar";
+import { cIDR, submit, USDC } from "./lib/stellar";
+import { parseQris } from "./lib/qris";
+import { escrowLock, escrowRelease, makePickup } from "./lib/soroban";
+import { cashouts, users } from "./db/schema";
 import { createWallet, walletBalances } from "./services/custody";
 import { quoteUsdcToCidr, swapUsdcToCidr } from "./services/fx";
 
 const app = new Hono();
+
+app.use("*", cors());
 
 const findUser = async (waNumber: string) =>
   (await db.select().from(users).where(eq(users.waNumber, waNumber)))[0];
@@ -62,6 +67,105 @@ app.post("/fx/swap", async (c) => {
   if (!user) return c.json({ error: "not found" }, 404);
   const hash = await swapUsdcToCidr(Keypair.fromSecret(user.secret), Number(usdc));
   return c.json({ hash, balances: await walletBalances(user.publicKey) });
+});
+
+app.post("/qris/decode", async (c) => {
+  const { payload } = await c.req.json();
+  if (!payload) return c.json({ error: "payload required" }, 400);
+  return c.json(parseQris(payload));
+});
+
+app.post("/pay", async (c) => {
+  const { waNumber, payload, amount } = await c.req.json();
+  const user = await findUser(waNumber);
+  if (!user) return c.json({ error: "not found" }, 404);
+
+  const info = parseQris(payload);
+  const amountIdr = info.amount ?? Number(amount);
+  if (!amountIdr || amountIdr <= 0) return c.json({ error: "amount required" }, 400);
+
+  const userKp = Keypair.fromSecret(user.secret);
+  const res = await submit(userKp, (b) =>
+    b.addOperation(
+      Operation.payment({
+        destination: process.env.TREASURY_PUBLIC!,
+        asset: cIDR(),
+        amount: amountIdr.toFixed(7),
+      }),
+    ),
+  );
+
+  return c.json({
+    merchant: info.merchantName,
+    city: info.city,
+    amountIdr,
+    hash: res.hash,
+    balances: await walletBalances(user.publicKey),
+  });
+});
+
+const CASHOUT_FEE_BPS = 100;
+
+app.post("/cashout/request", async (c) => {
+  const { waNumber, amountIdr } = await c.req.json();
+  const user = await findUser(waNumber);
+  if (!user) return c.json({ error: "not found" }, 404);
+  const amount = Number(amountIdr);
+  if (!amount || amount <= 0) return c.json({ error: "amount required" }, 400);
+
+  const pickup = makePickup();
+  const { escrowId } = await escrowLock({
+    touristKp: Keypair.fromSecret(user.secret),
+    amountCidr: amount,
+    agentPub: process.env.AGENT_PUBLIC!,
+    platformPub: process.env.TREASURY_PUBLIC!,
+    feeBps: CASHOUT_FEE_BPS,
+    pickupHash: pickup.hash,
+  });
+
+  await db.insert(cashouts).values({
+    escrowId,
+    waNumber,
+    amountIdr: amount,
+    codeHex: pickup.codeHex,
+    status: "pending",
+    createdAt: Date.now(),
+  });
+
+  return c.json({
+    escrowId,
+    codeHex: pickup.codeHex,
+    amountIdr: amount,
+    balances: await walletBalances(user.publicKey),
+  });
+});
+
+app.get("/cashout/:escrowId", async (c) => {
+  const id = Number(c.req.param("escrowId"));
+  const row = (await db.select().from(cashouts).where(eq(cashouts.escrowId, id)))[0];
+  if (!row) return c.json({ error: "not found" }, 404);
+  const fee = Math.round((row.amountIdr * CASHOUT_FEE_BPS) / 10000);
+  return c.json({
+    escrowId: row.escrowId,
+    amountIdr: row.amountIdr,
+    agentReceives: row.amountIdr - fee,
+    status: row.status,
+  });
+});
+
+app.post("/cashout/redeem", async (c) => {
+  const { escrowId, codeHex } = await c.req.json();
+  const id = Number(escrowId);
+  const row = (await db.select().from(cashouts).where(eq(cashouts.escrowId, id)))[0];
+  if (!row) return c.json({ error: "not found" }, 404);
+  if (row.status === "paid") return c.json({ error: "already paid out" }, 400);
+
+  const treasury = Keypair.fromSecret(process.env.TREASURY_SECRET!);
+  await escrowRelease(treasury, id, codeHex || row.codeHex);
+  await db.update(cashouts).set({ status: "paid" }).where(eq(cashouts.escrowId, id));
+
+  const fee = Math.round((row.amountIdr * CASHOUT_FEE_BPS) / 10000);
+  return c.json({ escrowId: id, amountIdr: row.amountIdr, agentReceived: row.amountIdr - fee, fee });
 });
 
 export default { port: Number(process.env.PORT ?? 3001), fetch: app.fetch };
