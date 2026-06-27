@@ -1,7 +1,9 @@
 import { Keypair, Operation } from "@stellar/stellar-sdk";
 import { desc, eq } from "drizzle-orm";
-import { Hono } from "hono";
+import { type Context, Hono } from "hono";
 import { cors } from "hono/cors";
+import { logger } from "hono/logger";
+import twilio from "twilio";
 import { db } from "./db";
 import { cIDR, submit, USDC } from "./lib/stellar";
 import { parseQris } from "./lib/qris";
@@ -12,6 +14,7 @@ import { quoteUsdcToCidr, swapUsdcToCidr } from "./services/fx";
 
 const app = new Hono();
 
+app.use("*", logger());
 app.use("*", cors());
 
 const findUser = async (waNumber: string) =>
@@ -262,18 +265,60 @@ async function botReply(waNumber: string, message: string): Promise<string> {
   return `👋 Welcome to *Castel* — fair-rate rupiah for Bali, no bank needed.\n\nTry:\n• *balance*\n• *topup* — add 200 USDC (demo)\n• *exchange 200* — swap to rupiah\n• *pay* — pay a QRIS merchant\n• *cash* — withdraw at an agent`;
 }
 
+const twilioClient =
+  process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
+    ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
+    : null;
+
+async function sendWa(to: string, body: string) {
+  if (!twilioClient) return;
+  try {
+    await twilioClient.messages.create({ from: process.env.TWILIO_WHATSAPP_FROM!, to, body });
+  } catch (e) {
+    console.error("sendWa failed:", (e as Error).message);
+  }
+}
+
+/// On-chain commands take a few seconds — show an instant acknowledgement.
+function loadingMessage(text: string): string | null {
+  const t = text.trim().toLowerCase();
+  if (t.startsWith("top")) return "⏳ Topping up your USDC…";
+  if (t.startsWith("exchange") || t.startsWith("swap")) return "⏳ Exchanging at the best rate… one moment";
+  if (t.startsWith("cash") || t.startsWith("withdraw")) return "⏳ Preparing your cash pickup…";
+  return null;
+}
+
+function twiml(c: Context, message: string) {
+  const body = `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${escapeXml(message)}</Message></Response>`;
+  return c.body(body, 200, { "content-type": "text/xml" });
+}
+
 app.post("/wa/webhook", async (c) => {
   const form = await c.req.parseBody();
   const from = String(form.From ?? "").replace("whatsapp:", "");
   const body = String(form.Body ?? "");
+
+  const loading = loadingMessage(body);
+  if (loading && twilioClient) {
+    void (async () => {
+      let reply: string;
+      try {
+        reply = await botReply(from, body);
+      } catch (e) {
+        reply = "⚠️ Something went wrong: " + (e as Error).message;
+      }
+      await sendWa("whatsapp:" + from, reply);
+    })();
+    return twiml(c, loading);
+  }
+
   let reply: string;
   try {
     reply = await botReply(from, body);
   } catch (e) {
     reply = "⚠️ Something went wrong: " + (e as Error).message;
   }
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${escapeXml(reply)}</Message></Response>`;
-  return c.body(twiml, 200, { "content-type": "text/xml" });
+  return twiml(c, reply);
 });
 
 export default { port: Number(process.env.PORT ?? 3001), fetch: app.fetch };
