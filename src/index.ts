@@ -132,6 +132,7 @@ app.post("/pay", async (c) => {
 });
 
 const CASHOUT_FEE_BPS = 100;
+const agentFee = (amountIdr: number) => Math.round((amountIdr * CASHOUT_FEE_BPS) / 10000);
 
 app.post("/cashout/request", async (c) => {
   const { waNumber, amountIdr } = await c.req.json();
@@ -173,7 +174,7 @@ app.get("/cashout/:escrowId", async (c) => {
   const id = Number(c.req.param("escrowId"));
   const row = (await db.select().from(cashouts).where(eq(cashouts.escrowId, id)))[0];
   if (!row) return c.json({ error: "not found" }, 404);
-  const fee = Math.round((row.amountIdr * CASHOUT_FEE_BPS) / 10000);
+  const fee = agentFee(row.amountIdr);
   return c.json({
     escrowId: row.escrowId,
     amountIdr: row.amountIdr,
@@ -193,7 +194,7 @@ app.post("/cashout/redeem", async (c) => {
   await escrowRelease(treasury, id, codeHex || row.codeHex);
   await db.update(cashouts).set({ status: "paid" }).where(eq(cashouts.escrowId, id));
 
-  const fee = Math.round((row.amountIdr * CASHOUT_FEE_BPS) / 10000);
+  const fee = agentFee(row.amountIdr);
   return c.json({ escrowId: id, amountIdr: row.amountIdr, agentReceived: row.amountIdr - fee, fee });
 });
 
@@ -279,7 +280,7 @@ async function sendWa(to: string, body: string) {
   }
 }
 
-/// On-chain commands take a few seconds — show an instant acknowledgement.
+// On-chain commands take a few seconds — show an instant acknowledgement.
 function loadingMessage(text: string): string | null {
   const t = text.trim().toLowerCase();
   if (t.startsWith("top")) return "⏳ Topping up your USDC…";

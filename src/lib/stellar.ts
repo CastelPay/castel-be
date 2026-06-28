@@ -16,8 +16,6 @@ export const NETWORK_PASSPHRASE = Networks.TESTNET;
 export const HORIZON_URL = process.env.HORIZON_URL ?? "https://horizon-testnet.stellar.org";
 export const horizon = new Horizon.Server(HORIZON_URL);
 
-/** Castel's spread over mid-market, in basis points (50 bps = ~Rp 82 on 16,500). */
-export const CASTEL_SPREAD_BPS = 30;
 /** Typical money-changer markdown vs mid-market, for the savings comparison. */
 export const MONEY_CHANGER_MARKDOWN = 200; // IDR per USD
 
@@ -61,19 +59,7 @@ export async function submit(
   }
 }
 
-export type Balance = { asset: string; balance: string };
-
-/** Read an account's balances as {asset, balance}, asset = "XLM" or "CODE:ISSUER". */
-export async function getBalances(publicKey: string): Promise<Balance[]> {
-  const acc = await horizon.loadAccount(publicKey);
-  return acc.balances.map((b: any) => ({
-    asset:
-      b.asset_type === "native" ? "XLM" : `${b.asset_code}:${b.asset_issuer}`,
-    balance: b.balance,
-  }));
-}
-
-/** Convenience: balance of a specific Asset for an account (string, "0" if none). */
+/** Balance of a specific Asset for an account (string, "0" if none). */
 export async function balanceOf(publicKey: string, asset: Asset): Promise<string> {
   const acc = await horizon.loadAccount(publicKey);
   const found = acc.balances.find(
