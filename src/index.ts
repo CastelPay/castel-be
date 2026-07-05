@@ -314,9 +314,8 @@ async function botReply(waNumber: string, message: string): Promise<string> {
     const b = await internal(`/balance/${encodeURIComponent(waNumber)}`);
     return `💰 Your balance\nRupiah: Rp ${fmt(b.cIDR)}\nUSDC: ${Number(b.USDC).toFixed(2)}`;
   }
-  if (t.startsWith("top")) {
-    const b = await internal("/fund", { waNumber, usdc: 200 });
-    return `✅ Topped up 200 USDC (demo).\nUSDC: ${Number(b.USDC).toFixed(2)}`;
+  if (t.startsWith("top") || t.startsWith("deposit") || t.startsWith("add")) {
+    return `💳 Tap to add money with your card:\n${link("/wallet")}&topup=1`;
   }
   if (t.startsWith("exchange") || t.startsWith("swap")) {
     const usdc = numIn(t);
@@ -332,7 +331,7 @@ async function botReply(waNumber: string, message: string): Promise<string> {
   if (t.startsWith("cash") || t.startsWith("withdraw")) {
     return `💵 Tap to get cash at a Castel agent:\n${link("/cashout")}`;
   }
-  return `👋 Welcome to *Castel* — fair-rate rupiah for Bali, no bank needed.\n\nTry:\n• *balance*\n• *topup* — add 200 USDC (demo)\n• *exchange 200* — swap to rupiah\n• *pay* — pay a QRIS merchant\n• *cash* — withdraw at an agent`;
+  return `👋 Welcome to *Castel* — fair-rate rupiah for Bali, no bank needed.\n\nTry:\n• *balance*\n• *topup* — add money with your card\n• *exchange 200* — swap to rupiah\n• *pay* — pay a QRIS merchant\n• *cash* — withdraw at an agent`;
 }
 
 const twilioClient =
@@ -352,7 +351,6 @@ async function sendWa(to: string, body: string) {
 // On-chain commands take a few seconds — show an instant acknowledgement.
 function loadingMessage(text: string): string | null {
   const t = text.trim().toLowerCase();
-  if (t.startsWith("top")) return "⏳ Topping up your USDC…";
   if (t.startsWith("exchange") || t.startsWith("swap")) return "⏳ Exchanging at the best rate… one moment";
   if (t.startsWith("cash") || t.startsWith("withdraw")) return "⏳ Preparing your cash pickup…";
   return null;
