@@ -8,6 +8,7 @@ import Stripe from "stripe";
 import { db } from "./db";
 import { cIDR, submit, USDC } from "./lib/stellar";
 import { parseQris } from "./lib/qris";
+import { settleToMerchant, xenditEnabled, type Settlement } from "./lib/xendit";
 import { escrowLock, escrowRelease, makePickup } from "./lib/soroban";
 import { cashouts, transactions, users } from "./db/schema";
 import { createWallet, walletBalances } from "./services/custody";
@@ -191,11 +192,27 @@ app.post("/pay", async (c) => {
 
   await recordTx(waNumber, "pay", info.merchantName, amountIdr, "out", res.hash);
 
+  // Settle IDR to the merchant via Xendit sandbox. Non-fatal: the on-chain debit
+  // already succeeded, so a settlement error must not fail the payment.
+  let settlement: Settlement | { error: string } | null = null;
+  if (xenditEnabled()) {
+    try {
+      settlement = await settleToMerchant({
+        externalId: `castel-pay-${res.hash.slice(0, 24)}`,
+        amountIdr,
+        merchantName: info.merchantName,
+      });
+    } catch (e) {
+      settlement = { error: (e as Error).message };
+    }
+  }
+
   return c.json({
     merchant: info.merchantName,
     city: info.city,
     amountIdr,
     hash: res.hash,
+    settlement,
     balances: await walletBalances(user.publicKey),
   });
 });
