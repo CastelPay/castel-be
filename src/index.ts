@@ -4,6 +4,7 @@ import { type Context, Hono } from "hono";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import twilio from "twilio";
+import Stripe from "stripe";
 import { db } from "./db";
 import { cIDR, submit, USDC } from "./lib/stellar";
 import { parseQris } from "./lib/qris";
@@ -80,6 +81,74 @@ app.post("/fund", async (c) => {
     ),
   );
   return c.json(await walletBalances(user.publicKey));
+});
+
+const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
+
+app.post("/deposit/create", async (c) => {
+  if (!stripe) return c.json({ error: "stripe not configured" }, 500);
+  const { waNumber, usd } = await c.req.json();
+  const user = await findUser(waNumber);
+  if (!user) return c.json({ error: "not found" }, 404);
+  const amount = Number(usd);
+  if (!amount || amount <= 0) return c.json({ error: "amount required" }, 400);
+
+  const web = process.env.WEB_WALLET_URL ?? "http://localhost:3000";
+  const wa = encodeURIComponent(waNumber);
+  const session = await stripe.checkout.sessions.create({
+    mode: "payment",
+    line_items: [
+      {
+        quantity: 1,
+        price_data: {
+          currency: "usd",
+          unit_amount: Math.round(amount * 100),
+          product_data: {
+            name: "Castel USD deposit",
+            description: `Adds $${amount} USDC to your Castel wallet`,
+          },
+        },
+      },
+    ],
+    success_url: `${web}/wallet?wa=${wa}&deposit={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${web}/wallet?wa=${wa}&deposit=cancel`,
+    metadata: { waNumber, usd: String(amount) },
+  });
+
+  return c.json({ url: session.url });
+});
+
+app.post("/deposit/confirm", async (c) => {
+  if (!stripe) return c.json({ error: "stripe not configured" }, 500);
+  const { sessionId } = await c.req.json();
+  if (!sessionId) return c.json({ error: "sessionId required" }, 400);
+
+  const session = await stripe.checkout.sessions.retrieve(sessionId);
+  if (session.payment_status !== "paid")
+    return c.json({ error: "not paid", status: session.payment_status }, 402);
+
+  const waNumber = String(session.metadata?.waNumber ?? "");
+  const user = await findUser(waNumber);
+  if (!user) return c.json({ error: "not found" }, 404);
+
+  const usd = Number(session.metadata?.usd ?? (session.amount_total ?? 0) / 100);
+  const balances = await walletBalances(user.publicKey);
+
+  // Idempotent: the confirm redirect can fire more than once — credit only once per session.
+  const already = (
+    await db.select().from(transactions).where(eq(transactions.hash, sessionId))
+  )[0];
+  if (already) return c.json({ credited: false, usd, balances });
+
+  const treasury = Keypair.fromSecret(process.env.TREASURY_SECRET!);
+  await submit(treasury, (b) =>
+    b.addOperation(
+      Operation.payment({ destination: user.publicKey, asset: USDC(), amount: String(usd) }),
+    ),
+  );
+  await recordTx(waNumber, "deposit", `Deposited $${usd} (card)`, usd, "in", sessionId);
+
+  return c.json({ credited: true, usd, balances: await walletBalances(user.publicKey) });
 });
 
 app.post("/fx/swap", async (c) => {
