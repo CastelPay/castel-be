@@ -109,8 +109,13 @@ app.post("/auth/request", async (c) => {
     .set({ otpHash: await hashSecret(otp), otpExpires: Date.now() + OTP_TTL_MS, otpAttempts: 0 })
     .where(eq(users.id, user.id));
 
-  await sendWa("whatsapp:" + wa, `🔐 Your Castel code is ${otp}\nIt expires in 5 minutes.`);
-  if (!twilioClient) console.log(`[dev] OTP for ${wa}: ${otp}`);
+  if (process.env.LOG_OTP === "true") console.log(`[dev] OTP for ${wa}: ${otp}`);
+
+  const sent = await sendWa("whatsapp:" + wa, `🔐 Your Castel code is ${otp}\nIt expires in 5 minutes.`);
+  // Twilio's WhatsApp sandbox will only deliver to numbers that have joined it.
+  // Reporting success anyway leaves the user waiting for a code that never arrives.
+  if (!sent && !process.env.LOG_OTP)
+    return c.json({ error: "couldn't reach that number on WhatsApp — message the bot first" }, 502);
 
   return c.json({ sent: true });
 });
@@ -138,6 +143,7 @@ app.post("/auth/verify", async (c) => {
 
   return c.json({
     token: signToken(wa, "session", SESSION_TTL_MS),
+    waNumber: wa,
     publicKey: user.publicKey,
     hasPin: !!user.pinHash,
   });
@@ -152,6 +158,7 @@ app.post("/auth/exchange", async (c) => {
   const user = await ensureUser(wa);
   return c.json({
     token: signToken(wa, "session", SESSION_TTL_MS),
+    waNumber: wa,
     publicKey: user.publicKey,
     hasPin: !!user.pinHash,
   });
@@ -503,12 +510,14 @@ const twilioClient =
     ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
     : null;
 
-async function sendWa(to: string, body: string) {
-  if (!twilioClient) return;
+async function sendWa(to: string, body: string): Promise<boolean> {
+  if (!twilioClient) return false;
   try {
     await twilioClient.messages.create({ from: process.env.TWILIO_WHATSAPP_FROM!, to, body });
+    return true;
   } catch (e) {
     console.error("sendWa failed:", (e as Error).message);
+    return false;
   }
 }
 
