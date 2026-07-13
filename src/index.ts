@@ -254,7 +254,8 @@ app.post("/deposit/create", requireAuth, async (c) => {
   const amount = Number(usd);
   if (!amount || amount <= 0) return c.json({ error: "amount required" }, 400);
 
-  const limit = await checkDepositLimit(waNumber, amount);
+  const quote = await quoteUsdcToCidr(amount);
+  const limit = await checkDepositLimit(waNumber, quote.cidrOut);
   if (!limit.ok) return c.json({ error: limit.error }, 403);
 
   const session = await stripe.checkout.sessions.create({
@@ -266,8 +267,8 @@ app.post("/deposit/create", requireAuth, async (c) => {
           currency: "usd",
           unit_amount: Math.round(amount * 100),
           product_data: {
-            name: "Castel USD deposit",
-            description: `Adds $${amount} USDC to your Castel wallet`,
+            name: "Castel top-up",
+            description: `Adds about ${rupiah(quote.cidrOut)} to your Castel balance`,
           },
         },
       },
@@ -310,9 +311,33 @@ app.post("/deposit/confirm", requireAuth, async (c) => {
       Operation.payment({ destination: user.publicKey, asset: USDC(), amount: String(usd) }),
     ),
   );
-  await recordTx(waNumber, "deposit", `Deposited $${usd} (card)`, usd, "in", sessionId);
 
-  return c.json({ credited: true, usd, balances: await walletBalances(user.publicKey) });
+  // The tourist bought rupiah, not crypto. USDC is a rail, so it is converted here
+  // rather than left on the balance for them to reason about.
+  const userKp = Keypair.fromSecret(user.secret);
+  try {
+    const { hash, quote } = await swapUsdcToCidr(userKp, usd);
+    await recordTx(waNumber, "deposit", `Added ${rupiah(quote.cidrOut)}`, quote.cidrOut, "in", sessionId);
+    return c.json({
+      credited: true,
+      usd,
+      cidr: quote.cidrOut,
+      rate: quote.rate,
+      savingsIdr: quote.savingsIdr,
+      hash,
+      balances: await walletBalances(user.publicKey),
+    });
+  } catch (e) {
+    // The card already cleared, so the money must not vanish: keep it as USDC and let
+    // the wallet offer a manual exchange.
+    await recordTx(waNumber, "deposit", `Added $${usd} (exchange pending)`, 0, "in", sessionId);
+    return c.json({
+      credited: true,
+      usd,
+      exchangeFailed: (e as Error).message,
+      balances: await walletBalances(user.publicKey),
+    });
+  }
 });
 
 app.post("/fx/swap", requireAuth, async (c) => {
@@ -483,6 +508,7 @@ app.get("/me/history", requireAuth, async (c) => {
 });
 
 const fmt = (n: string | number) => new Intl.NumberFormat("id-ID").format(Math.round(Number(n)));
+const rupiah = (n: number) => `Rp ${fmt(n)}`;
 const escapeXml = (s: string) =>
   s.replace(/[<>&'"]/g, (ch) =>
     ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", "'": "&apos;", '"': "&quot;" })[ch]!,
@@ -519,10 +545,11 @@ async function botReply(waNumber: string, message: string): Promise<string> {
 
   if (t.startsWith("bal")) {
     const b = await internal("/me/balance", undefined, waNumber);
-    return `💰 Your balance\nRupiah: Rp ${fmt(b.cIDR)}\nUSDC: ${Number(b.USDC).toFixed(2)}`;
+    const pending = Number(b.USDC) > 0 ? `\n(${Number(b.USDC).toFixed(2)} USDC not yet exchanged)` : "";
+    return `💰 Your balance\n${rupiah(Number(b.cIDR))}${pending}`;
   }
   if (t.startsWith("top") || t.startsWith("deposit") || t.startsWith("add")) {
-    return `💳 Tap to add money with your card:\n${link("/wallet")}&topup=1`;
+    return `💳 Tap to add rupiah with your card:\n${link("/wallet")}&topup=1`;
   }
   if (t.startsWith("exchange") || t.startsWith("swap")) {
     const usdc = numIn(t);
@@ -538,7 +565,7 @@ async function botReply(waNumber: string, message: string): Promise<string> {
   if (t.startsWith("cash") || t.startsWith("withdraw")) {
     return `💵 Tap to get cash at a Castel agent:\n${link("/cashout")}`;
   }
-  return `👋 Welcome to *Castel* — fair-rate rupiah for Bali, no bank needed.\n\nTry:\n• *balance*\n• *topup* — add money with your card\n• *exchange 200* — swap to rupiah\n• *pay* — pay a QRIS merchant\n• *cash* — withdraw at an agent`;
+  return `👋 Welcome to *Castel* — fair-rate rupiah for Bali, no bank needed.\n\nTry:\n• *balance* — see your rupiah\n• *topup* — add rupiah with your card\n• *pay* — scan & pay any QRIS merchant\n• *cash* — withdraw cash at an agent`;
 }
 
 const twilioClient =

@@ -12,11 +12,9 @@ import { transactions } from "../db/schema";
  */
 export const TIER0_TX_CAP_IDR = 16_500_000;
 export const TIER0_WINDOW_CAP_IDR = 16_500_000;
-export const TIER0_TX_CAP_USD = 1_000;
-export const TIER0_WINDOW_CAP_USD = 1_000;
 export const WINDOW_MS = 30 * 24 * 60 * 60_000;
 
-/** Rows of type "deposit" store USD in amount_idr, so the two flows are summed apart. */
+/** Every amount in the ledger is rupiah — deposits are converted before they are recorded. */
 async function sumSince(waNumber: string, types: string[]): Promise<number> {
   const [row] = await db
     .select({ total: sql<number>`coalesce(sum(${transactions.amountIdr}), 0)::bigint` })
@@ -32,39 +30,43 @@ async function sumSince(waNumber: string, types: string[]): Promise<number> {
 }
 
 export const spentIdr = (waNumber: string) => sumSince(waNumber, ["pay", "cashout"]);
-export const depositedUsd = (waNumber: string) => sumSince(waNumber, ["deposit"]);
+export const depositedIdr = (waNumber: string) => sumSince(waNumber, ["deposit"]);
+
+const rupiah = (n: number) => `Rp ${Math.round(n).toLocaleString("id-ID")}`;
 
 export type LimitCheck = { ok: true } | { ok: false; error: string };
 
-export async function checkSpendLimit(waNumber: string, amountIdr: number): Promise<LimitCheck> {
+async function check(waNumber: string, amountIdr: number, used: () => Promise<number>, what: string) {
   if (amountIdr > TIER0_TX_CAP_IDR)
-    return { ok: false, error: `single transaction limit is Rp ${TIER0_TX_CAP_IDR.toLocaleString("id-ID")} — verify your passport to raise it` };
-  const spent = await spentIdr(waNumber);
-  if (spent + amountIdr > TIER0_WINDOW_CAP_IDR)
-    return { ok: false, error: `30-day limit reached (Rp ${spent.toLocaleString("id-ID")} of Rp ${TIER0_WINDOW_CAP_IDR.toLocaleString("id-ID")}) — verify your passport to raise it` };
-  return { ok: true };
+    return {
+      ok: false as const,
+      error: `single ${what} limit is ${rupiah(TIER0_TX_CAP_IDR)} — verify your passport to raise it`,
+    };
+  const already = await used();
+  if (already + amountIdr > TIER0_WINDOW_CAP_IDR)
+    return {
+      ok: false as const,
+      error: `30-day ${what} limit reached (${rupiah(already)} of ${rupiah(TIER0_WINDOW_CAP_IDR)}) — verify your passport to raise it`,
+    };
+  return { ok: true as const };
 }
 
-export async function checkDepositLimit(waNumber: string, usd: number): Promise<LimitCheck> {
-  if (usd > TIER0_TX_CAP_USD)
-    return { ok: false, error: `single deposit limit is $${TIER0_TX_CAP_USD} — verify your passport to raise it` };
-  const deposited = await depositedUsd(waNumber);
-  if (deposited + usd > TIER0_WINDOW_CAP_USD)
-    return { ok: false, error: `30-day deposit limit reached ($${deposited} of $${TIER0_WINDOW_CAP_USD}) — verify your passport to raise it` };
-  return { ok: true };
-}
+export const checkSpendLimit = (wa: string, amountIdr: number): Promise<LimitCheck> =>
+  check(wa, amountIdr, () => spentIdr(wa), "transaction");
+
+export const checkDepositLimit = (wa: string, amountIdr: number): Promise<LimitCheck> =>
+  check(wa, amountIdr, () => depositedIdr(wa), "top-up");
 
 export async function limitsFor(waNumber: string) {
-  const [spent, deposited] = await Promise.all([spentIdr(waNumber), depositedUsd(waNumber)]);
+  const [spent, deposited] = await Promise.all([spentIdr(waNumber), depositedIdr(waNumber)]);
   return {
     tier: 0,
     tierName: "Simplified CDD",
     spentIdr: spent,
     spendCapIdr: TIER0_WINDOW_CAP_IDR,
     remainingIdr: Math.max(0, TIER0_WINDOW_CAP_IDR - spent),
-    depositedUsd: deposited,
-    depositCapUsd: TIER0_WINDOW_CAP_USD,
-    remainingUsd: Math.max(0, TIER0_WINDOW_CAP_USD - deposited),
+    depositedIdr: deposited,
+    depositCapIdr: TIER0_WINDOW_CAP_IDR,
     windowDays: 30,
   };
 }
