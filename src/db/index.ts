@@ -34,5 +34,21 @@ await sql`CREATE TABLE IF NOT EXISTS cashouts (
   created_at BIGINT NOT NULL
 )`;
 
+for (const col of [
+  "pin_hash TEXT",
+  "pin_attempts INTEGER NOT NULL DEFAULT 0",
+  "otp_hash TEXT",
+  "otp_expires BIGINT",
+  "otp_attempts INTEGER NOT NULL DEFAULT 0",
+]) {
+  await sql.unsafe(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ${col}`);
+}
+
+// Deposit idempotency is keyed on the Stripe session id stored in `hash`. The
+// read-then-write check in /deposit/confirm races with itself on a double redirect,
+// so the database is the thing that actually has to enforce "credit once".
+await sql`CREATE UNIQUE INDEX IF NOT EXISTS transactions_hash_uniq
+  ON transactions (hash) WHERE hash IS NOT NULL`;
+
 export const db = drizzle(sql, { schema });
 export { schema };

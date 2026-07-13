@@ -3,7 +3,16 @@ const key = process.env.XENDIT_SECRET_KEY;
 
 export const xenditEnabled = () => !!key;
 
-async function xnd(path: string, method: string, body?: unknown) {
+type XenditResponse = {
+  id?: string;
+  status?: string;
+  amount?: number;
+  bank_code?: string;
+  message?: string;
+  error_code?: string;
+};
+
+async function xnd(path: string, method: string, body?: unknown): Promise<XenditResponse> {
   if (!key) throw new Error("xendit not configured");
   const res = await fetch(BASE + path, {
     method,
@@ -13,7 +22,7 @@ async function xnd(path: string, method: string, body?: unknown) {
     },
     body: body ? JSON.stringify(body) : undefined,
   });
-  const data = await res.json();
+  const data = (await res.json()) as XenditResponse;
   if (!res.ok) throw new Error(data?.message ?? data?.error_code ?? "xendit request failed");
   return data;
 }
@@ -40,5 +49,10 @@ export async function settleToMerchant(params: {
     account_number: "1234567890",
     description: `Castel QRIS settlement — ${params.merchantName}`,
   });
-  return { id: d.id, status: d.status, amount: d.amount, channel: d.bank_code };
+  return {
+    id: d.id ?? "",
+    status: d.status ?? "UNKNOWN",
+    amount: d.amount ?? params.amountIdr,
+    channel: d.bank_code ?? "BCA",
+  };
 }

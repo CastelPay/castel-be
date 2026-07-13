@@ -6,6 +6,11 @@ export const users = pgTable("users", {
   publicKey: text("public_key").notNull(),
   secret: text("secret").notNull(),
   createdAt: bigint("created_at", { mode: "number" }).notNull(),
+  pinHash: text("pin_hash"),
+  pinAttempts: integer("pin_attempts").notNull().default(0),
+  otpHash: text("otp_hash"),
+  otpExpires: bigint("otp_expires", { mode: "number" }),
+  otpAttempts: integer("otp_attempts").notNull().default(0),
 });
 
 export const transactions = pgTable("transactions", {

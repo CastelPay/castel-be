@@ -30,7 +30,7 @@ async function main() {
   console.log(`    💰 Savings  : ${rupiah(q.savingsIdr)}`);
 
   console.log("\n🔄 Swapping via path payment...");
-  const hash = await swapUsdcToCidr(Keypair.fromSecret(tourist.secret), 200);
+  const { hash } = await swapUsdcToCidr(Keypair.fromSecret(tourist.secret), 200);
   console.log("    tx:", hash.slice(0, 16) + "…");
 
   console.log("\n✅ after:", await walletBalances(tourist.publicKey));
