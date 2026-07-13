@@ -26,6 +26,12 @@ import {
   verifySecret,
   verifyToken,
 } from "./lib/auth";
+import {
+  checkDepositLimit,
+  checkSpendLimit,
+  limitsFor,
+  rateLimit,
+} from "./lib/limits";
 import { cashouts, transactions, users } from "./db/schema";
 import { createWallet, walletBalances } from "./services/custody";
 import { quoteUsdcToCidr, swapUsdcToCidr } from "./services/fx";
@@ -35,6 +41,25 @@ const WEB = process.env.WEB_WALLET_URL ?? "http://localhost:3000";
 
 app.use("*", logger());
 app.use("*", cors({ origin: [WEB, "http://localhost:3000"], allowHeaders: ["content-type", "authorization"] }));
+
+const clientIp = (c: Context) =>
+  c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ?? "local";
+
+// Abuse control sits in front of anything that costs us money or reaches Twilio.
+app.use("/auth/*", async (c, next) => {
+  if (!rateLimit("auth:" + clientIp(c), 10, 60_000))
+    return c.json({ error: "too many attempts — try again in a minute" }, 429);
+  await next();
+});
+
+for (const path of ["/pay", "/cashout/request", "/fx/swap", "/deposit/create", "/fund"]) {
+  app.use(path, async (c, next) => {
+    const who = c.req.header("Authorization") ?? clientIp(c);
+    if (!rateLimit("money:" + who, 20, 60_000))
+      return c.json({ error: "too many requests — slow down" }, 429);
+    await next();
+  });
+}
 
 const findUser = async (waNumber: string) =>
   (await db.select().from(users).where(eq(users.waNumber, waNumber)))[0];
@@ -183,6 +208,8 @@ app.post("/me/pin", requireAuth, async (c) => {
   return c.json({ ok: true });
 });
 
+app.get("/me/limits", requireAuth, async (c) => c.json(await limitsFor(c.get("wa"))));
+
 app.get("/me/balance", requireAuth, async (c) => {
   const user = await findUser(c.get("wa"));
   if (!user) return c.json({ error: "not found" }, 404);
@@ -226,6 +253,9 @@ app.post("/deposit/create", requireAuth, async (c) => {
   if (!user) return c.json({ error: "not found" }, 404);
   const amount = Number(usd);
   if (!amount || amount <= 0) return c.json({ error: "amount required" }, 400);
+
+  const limit = await checkDepositLimit(waNumber, amount);
+  if (!limit.ok) return c.json({ error: limit.error }, 403);
 
   const session = await stripe.checkout.sessions.create({
     mode: "payment",
@@ -318,6 +348,9 @@ app.post("/pay", requireAuth, async (c) => {
   const amountIdr = info.amount ?? Number(amount);
   if (!amountIdr || amountIdr <= 0) return c.json({ error: "amount required" }, 400);
 
+  const limit = await checkSpendLimit(waNumber, amountIdr);
+  if (!limit.ok) return c.json({ error: limit.error }, 403);
+
   const userKp = Keypair.fromSecret(user.secret);
   const res = await submit(userKp, (b) =>
     b.addOperation(
@@ -370,6 +403,9 @@ app.post("/cashout/request", requireAuth, async (c) => {
 
   const amount = Number(amountIdr);
   if (!amount || amount <= 0) return c.json({ error: "amount required" }, 400);
+
+  const limit = await checkSpendLimit(waNumber, amount);
+  if (!limit.ok) return c.json({ error: limit.error }, 403);
 
   const pickup = makePickup();
   const { escrowId, hash } = await escrowLock({
