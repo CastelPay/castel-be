@@ -12,7 +12,7 @@ export type Quote = {
   cidrOut: number;
   rate: number;
   midRate: number;
-  midSource: "live" | "cached" | "fallback";
+  midSource: Mid["source"];
   changerRate: number;
   changerCidr: number;
   savingsIdr: number;

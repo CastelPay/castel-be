@@ -44,6 +44,12 @@ for (const col of [
   await sql.unsafe(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ${col}`);
 }
 
+await sql`CREATE TABLE IF NOT EXISTS rates (
+  id SERIAL PRIMARY KEY,
+  usd_idr NUMERIC NOT NULL,
+  fetched_at BIGINT NOT NULL
+)`;
+
 // Deposit idempotency is keyed on the Stripe session id stored in `hash`. The
 // read-then-write check in /deposit/confirm races with itself on a double redirect,
 // so the database is the thing that actually has to enforce "credit once".
