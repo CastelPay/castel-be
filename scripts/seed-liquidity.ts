@@ -6,9 +6,10 @@
 import { Asset, Keypair, Operation } from "@stellar/stellar-sdk";
 import { fundTestnet, submit, horizon } from "../src/lib/stellar";
 
-const MID = 16500;
-const ASK = 16450; // cIDR per USDC a tourist receives when funding (USDC -> cIDR)
-const BID = 16550; // cIDR per USDC required when cashing out (cIDR -> USDC)
+import { usdIdrMid } from "../src/lib/rates";
+
+/** Castel's margin, applied either side of the live mid. */
+const SPREAD_BPS = 30;
 
 async function trustIfNeeded(kp: Keypair, asset: Asset, label: string) {
   const acc = await horizon.loadAccount(kp.publicKey());
@@ -22,6 +23,13 @@ async function trustIfNeeded(kp: Keypair, asset: Asset, label: string) {
 
 async function main() {
   console.log("💧 Seeding USDC <-> cIDR market on testnet\n");
+
+  // Prices track the live USD/IDR mid — a hardcoded rate is wrong the moment it is written.
+  const mid = await usdIdrMid();
+  const MID = mid.rate;
+  const ASK = Math.round((MID * (10_000 - SPREAD_BPS)) / 10_000);
+  const BID = Math.round((MID * (10_000 + SPREAD_BPS)) / 10_000);
+  console.log(`📈 USD/IDR mid ${MID.toFixed(2)} (${mid.source}) → ask ${ASK} / bid ${BID}\n`);
 
   const distributor = Keypair.fromSecret(process.env.DISTRIBUTOR_SECRET!);
   const treasury = Keypair.fromSecret(process.env.TREASURY_SECRET!);
@@ -72,7 +80,8 @@ async function main() {
         }),
       ),
   );
-  console.log(`  ✓ two-sided market live (ask ${ASK} / bid ${BID}, mid ${MID})`);
+  console.log(`  ✓ two-sided market live (ask ${ASK} / bid ${BID}, mid ${MID.toFixed(0)})`);
+  console.log("  → re-run scripts/refresh-market.ts on a schedule to track the rate");
 
   console.log("\n--- add to castel-be/.env ---");
   console.log(`USDC_ISSUER=${usdcIssuer.publicKey()}`);

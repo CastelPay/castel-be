@@ -98,7 +98,7 @@ Nothing in the core flow is mocked.
 |---|---|
 | **QRIS** | Real EMVCo TLV parser — decodes live merchant QR codes |
 | **Card on-ramp** | **Stripe** Checkout, test mode — a real card, charged in USD |
-| **FX** | **Stellar path payment** across the protocol's built-in order book — a real on-chain swap |
+| **FX** | **Stellar path payment** across the protocol's built-in order book — a real on-chain swap, priced against the **live USD/IDR rate** |
 | **Merchant settlement** | **Xendit** Disbursement API, sandbox — a real IDR payout call |
 | **Cash-out** | **Soroban escrow** on testnet — hashlock, refund timelock, fee split, on-chain release |
 | **WhatsApp** | **Twilio** WhatsApp sandbox — signature-verified webhook |
@@ -175,9 +175,13 @@ The things a judge would find, listed before they do:
 - **The escrow's `release()` has no `require_auth`** on the agent. The API requires the
   pickup code, so it is not exploitable through Castel — but on-chain it should be dual
   control.
-- **Card fees exceed our FX edge.** Stripe takes ~2.9%; our rate advantage over a money
-  changer is under 1%. Castel is **not the cheapest** way to get rupiah — it is the only one
-  available to a tourist with no Indonesian bank account. We do not claim otherwise.
+- **Card fees exceed our FX edge.** Stripe takes ~2.9% (and ~4.4% on a foreign-issued card);
+  our rate advantage over a money changer is under 1%. Castel is **not the cheapest** way to
+  get rupiah — it is the only one available to a tourist with no Indonesian bank account. We
+  do not claim otherwise.
+- **The money-changer comparison is an estimate.** The reference rate is live, but the
+  "typical money changer" is modelled as mid minus Rp 200/USD. The UI labels it as an
+  estimate rather than dressing an assumption up as a measurement.
 
 ---
 
@@ -195,7 +199,14 @@ Bootstrap a fresh testnet environment:
 bun run scripts/issue-cidr.ts       # issue cIDR; fund issuer, distributor, treasury
 bun run scripts/harden-issuer.ts    # AUTH_REVOCABLE + clawback + home_domain
 bun run scripts/seed-liquidity.ts   # two-sided USDC/cIDR market on the DEX
+bun run scripts/refresh-market.ts   # re-price the book against the live USD/IDR mid
 ```
+
+Stellar has **no peg mechanism** — a swap executes at whatever the order book says. The rate
+only tracks reality because a market maker keeps re-posting: that is `refresh-market.ts`, and
+it is the off-chain half of an anchor. Run it on a schedule. (An *on-chain* oracle would only
+be needed if a **contract** had to read the price; path payments read the order book, so the
+price feed belongs off-chain.)
 
 Tests:
 

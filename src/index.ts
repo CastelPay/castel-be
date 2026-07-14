@@ -35,6 +35,7 @@ import {
 import { cashouts, transactions, users } from "./db/schema";
 import { createWallet, walletBalances } from "./services/custody";
 import { quoteUsdcToCidr, swapUsdcToCidr } from "./services/fx";
+import { usdIdrMid } from "./lib/rates";
 
 const app = new Hono<Vars>();
 const WEB = process.env.WEB_WALLET_URL ?? "http://localhost:3000";
@@ -226,8 +227,7 @@ app.get("/fx/quote", async (c) => {
 // flag and the cap this is an open tap straight out of the treasury.
 const DEMO_FUND_MAX = 500;
 
-/** Only used to size a deposit against the tier cap when the DEX has no route to quote. */
-const INDICATIVE_RATE = 16_500;
+
 
 app.post("/fund", requireAuth, async (c) => {
   if (process.env.ALLOW_DEMO_FUND !== "true") return c.json({ error: "disabled" }, 403);
@@ -258,9 +258,9 @@ app.post("/deposit/create", requireAuth, async (c) => {
   if (!amount || amount <= 0) return c.json({ error: "amount required" }, 400);
 
   // A quote needs a route on the DEX, and a large enough amount has none. Fall back to
-  // an indicative rate so the tier limit — not a liquidity error — is what the user sees.
+  // the reference rate so the tier limit — not a liquidity error — is what the user sees.
   const quote = await quoteUsdcToCidr(amount).catch(() => null);
-  const idrValue = quote?.cidrOut ?? amount * INDICATIVE_RATE;
+  const idrValue = quote?.cidrOut ?? amount * (await usdIdrMid()).rate;
 
   const limit = await checkDepositLimit(waNumber, idrValue);
   if (!limit.ok) return c.json({ error: limit.error }, 403);

@@ -1,7 +1,6 @@
 import { Asset, Keypair, Operation } from "@stellar/stellar-sdk";
-import { cIDR, horizon, MONEY_CHANGER_MARKDOWN, submit, USDC } from "../lib/stellar";
-
-const MID_RATE = 16500;
+import { cIDR, horizon, submit, USDC } from "../lib/stellar";
+import { type Mid, MONEY_CHANGER_MARKDOWN, usdIdrMid } from "../lib/rates";
 
 /** How far the executed rate may drift from the quote before we abandon the swap. */
 const SLIPPAGE_BPS = 100;
@@ -12,19 +11,23 @@ export type Quote = {
   usdc: number;
   cidrOut: number;
   rate: number;
+  midRate: number;
+  midSource: "live" | "cached" | "fallback";
   changerRate: number;
   changerCidr: number;
   savingsIdr: number;
   path: Hop[];
 };
 
-export function buildQuote(usdc: number, cidrOut: number, path: Hop[] = []): Quote {
-  const changerRate = MID_RATE - MONEY_CHANGER_MARKDOWN;
+export function buildQuote(usdc: number, cidrOut: number, mid: Mid, path: Hop[] = []): Quote {
+  const changerRate = mid.rate - MONEY_CHANGER_MARKDOWN;
   const changerCidr = usdc * changerRate;
   return {
     usdc,
     cidrOut,
     rate: cidrOut / usdc,
+    midRate: mid.rate,
+    midSource: mid.source,
     changerRate,
     changerCidr,
     savingsIdr: cidrOut - changerCidr,
@@ -33,10 +36,17 @@ export function buildQuote(usdc: number, cidrOut: number, path: Hop[] = []): Quo
 }
 
 export async function quoteUsdcToCidr(usdc: number): Promise<Quote> {
-  const paths = await horizon.strictSendPaths(USDC(), usdc.toFixed(7), [cIDR()]).call();
+  // The executed rate comes from the order book. The reference rate only says what the
+  // wider market thinks a dollar is worth, so the money-changer comparison means something.
+  const [paths, mid] = await Promise.all([
+    horizon.strictSendPaths(USDC(), usdc.toFixed(7), [cIDR()]).call(),
+    usdIdrMid(),
+  ]);
+
   const best = paths.records[0];
   if (!best) throw new Error("no path USDC->cIDR (is the market seeded?)");
-  return buildQuote(usdc, Number(best.destination_amount), best.path as Hop[]);
+
+  return buildQuote(usdc, Number(best.destination_amount), mid, best.path as Hop[]);
 }
 
 const toAsset = (h: Hop) =>

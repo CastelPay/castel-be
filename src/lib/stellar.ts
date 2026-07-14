@@ -16,9 +16,6 @@ export const NETWORK_PASSPHRASE = Networks.TESTNET;
 export const HORIZON_URL = process.env.HORIZON_URL ?? "https://horizon-testnet.stellar.org";
 export const horizon = new Horizon.Server(HORIZON_URL);
 
-/** Typical money-changer markdown vs mid-market, for the savings comparison. */
-export const MONEY_CHANGER_MARKDOWN = 200; // IDR per USD
-
 function envAsset(codeKey: string, issuerKey: string, defCode: string): Asset {
   const code = process.env[codeKey] ?? defCode;
   const issuer = process.env[issuerKey];
