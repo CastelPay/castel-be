@@ -367,10 +367,16 @@ app.post("/pay/quick/create", requireAuth, async (c) => {
   const spend = await checkSpendLimit(waNumber, amountIdr);
   if (!spend.ok) return c.json({ error: spend.error }, 403);
 
-  const mid = await usdIdrMid();
-  const usd = Math.ceil((amountIdr / mid.rate) * (1 + QUICKPAY_BUFFER) * 100) / 100;
+  // Size the charge from the rate the swap will ACTUALLY execute at (the order book), not
+  // the external mid used for the savings comparison — the two can diverge, and using the
+  // mid would under-fund the swap and leave the merchant unpaid. Probe with a reference
+  // amount to read the DEX rate, then over-fund by the buffer.
+  const probe = await quoteUsdcToCidr(10).catch(() => null);
+  if (!probe) return c.json({ error: "can't price this right now — try again" }, 503);
+  const dexRate = probe.rate;
+  const usd = Math.ceil((amountIdr / dexRate) * (1 + QUICKPAY_BUFFER) * 100) / 100;
 
-  const dep = await checkDepositLimit(waNumber, usd * mid.rate);
+  const dep = await checkDepositLimit(waNumber, amountIdr);
   if (!dep.ok) return c.json({ error: dep.error }, 403);
 
   const session = await stripe.checkout.sessions.create({
