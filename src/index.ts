@@ -348,6 +348,142 @@ app.post("/deposit/confirm", requireAuth, async (c) => {
   }
 });
 
+// Over-fund the card charge by this much so the on-chain swap reliably clears the bill
+// despite the spread and slippage. The remainder lands as balance.
+const QUICKPAY_BUFFER = 0.03;
+
+// Quick pay: no prefund. Scan → pay, charging the card for exactly this bill (plus the
+// buffer). The card authorisation is the authorisation, so unlike a balance payment there
+// is no PIN — there was no pre-existing balance to protect, and the leftover buffer is all
+// that ends up on the wallet.
+app.post("/pay/quick/create", requireAuth, async (c) => {
+  if (!stripe) return c.json({ error: "stripe not configured" }, 500);
+  const waNumber = c.get("wa");
+  const { payload, amount } = await c.req.json();
+  const info = parseQris(String(payload ?? ""));
+  const amountIdr = info.amount ?? Number(amount);
+  if (!amountIdr || amountIdr <= 0) return c.json({ error: "amount required" }, 400);
+
+  const spend = await checkSpendLimit(waNumber, amountIdr);
+  if (!spend.ok) return c.json({ error: spend.error }, 403);
+
+  const mid = await usdIdrMid();
+  const usd = Math.ceil((amountIdr / mid.rate) * (1 + QUICKPAY_BUFFER) * 100) / 100;
+
+  const dep = await checkDepositLimit(waNumber, usd * mid.rate);
+  if (!dep.ok) return c.json({ error: dep.error }, 403);
+
+  const session = await stripe.checkout.sessions.create({
+    mode: "payment",
+    line_items: [
+      {
+        quantity: 1,
+        price_data: {
+          currency: "usd",
+          unit_amount: Math.round(usd * 100),
+          product_data: {
+            name: `Pay ${info.merchantName}`,
+            description: `${rupiah(amountIdr)} at ${info.merchantName}`,
+          },
+        },
+      },
+    ],
+    success_url: `${WEB}/pay?quick={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${WEB}/pay?quick=cancel`,
+    metadata: { waNumber, usd: String(usd), quickPayload: String(payload), quickAmountIdr: String(amountIdr) },
+  });
+
+  return c.json({ url: session.url, usd, amountIdr });
+});
+
+app.post("/pay/quick/confirm", requireAuth, async (c) => {
+  if (!stripe) return c.json({ error: "stripe not configured" }, 500);
+  const waNumber = c.get("wa");
+  const { sessionId } = await c.req.json();
+  if (!sessionId) return c.json({ error: "sessionId required" }, 400);
+
+  const session = await stripe.checkout.sessions.retrieve(sessionId);
+  if (session.payment_status !== "paid")
+    return c.json({ error: "not paid", status: session.payment_status }, 402);
+  if (session.metadata?.waNumber !== waNumber)
+    return c.json({ error: "session does not belong to you" }, 403);
+
+  const user = await findUser(waNumber);
+  if (!user) return c.json({ error: "not found" }, 404);
+
+  const usd = Number(session.metadata?.usd ?? 0);
+  const payload = String(session.metadata?.quickPayload ?? "");
+  const amountIdr = Number(session.metadata?.quickAmountIdr ?? 0);
+  const info = parseQris(payload);
+  const userKp = Keypair.fromSecret(user.secret);
+
+  // The card-charge leg is marked before the swap so a repeated redirect can never charge
+  // the card twice, even if the swap or the merchant payment below throws and is retried.
+  const charged = (
+    await db.select().from(transactions).where(eq(transactions.hash, sessionId))
+  )[0];
+  if (!charged) {
+    const treasury = Keypair.fromSecret(process.env.TREASURY_SECRET!);
+    await submit(treasury, (b) =>
+      b.addOperation(
+        Operation.payment({ destination: user.publicKey, asset: USDC(), amount: String(usd) }),
+      ),
+    );
+    await recordTx(waNumber, "deposit", `Card charge · ${info.merchantName}`, 0, "in", sessionId);
+    await swapUsdcToCidr(userKp, usd);
+  }
+
+  // The merchant-payment leg has its own marker keyed on the same session, so a retry
+  // after the swap resumes into the payment instead of paying the merchant twice.
+  const payHash = `${sessionId}:pay`;
+  const alreadyPaid = (
+    await db.select().from(transactions).where(eq(transactions.hash, payHash))
+  )[0];
+  if (alreadyPaid) {
+    return c.json({
+      merchant: info.merchantName,
+      city: info.city,
+      amountIdr,
+      alreadyPaid: true,
+      settlement: null,
+      balances: await walletBalances(user.publicKey),
+    });
+  }
+
+  const res = await submit(userKp, (b) =>
+    b.addOperation(
+      Operation.payment({
+        destination: process.env.TREASURY_PUBLIC!,
+        asset: cIDR(),
+        amount: amountIdr.toFixed(7),
+      }),
+    ),
+  );
+  await recordTx(waNumber, "pay", info.merchantName, amountIdr, "out", payHash);
+
+  let settlement: Settlement | { error: string } | null = null;
+  if (xenditEnabled()) {
+    try {
+      settlement = await settleToMerchant({
+        externalId: `castel-pay-${res.hash.slice(0, 24)}`,
+        amountIdr,
+        merchantName: info.merchantName,
+      });
+    } catch (e) {
+      settlement = { error: (e as Error).message };
+    }
+  }
+
+  return c.json({
+    merchant: info.merchantName,
+    city: info.city,
+    amountIdr,
+    hash: res.hash,
+    settlement,
+    balances: await walletBalances(user.publicKey),
+  });
+});
+
 app.post("/fx/swap", requireAuth, async (c) => {
   const waNumber = c.get("wa");
   const { usdc } = await c.req.json();
