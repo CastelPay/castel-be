@@ -7,6 +7,7 @@ No Indonesian bank account, no SIM card, no KTP. It runs on WhatsApp.
 
 🔗 **Live:** [castelpay.vercel.app](https://castelpay.vercel.app) · API [castel-be.onrender.com](https://castel-be.onrender.com)
 📦 [castel-sc](https://github.com/CastelPay/castel-sc) (Soroban) · **castel-be** (this repo) · [castel-fe](https://github.com/CastelPay/castel-fe)
+🏗️ **Architecture diagrams: [ARCHITECTURE.md](./ARCHITECTURE.md)**
 
 ---
 
