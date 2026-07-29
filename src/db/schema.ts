@@ -1,10 +1,13 @@
-import { bigint, integer, numeric, pgTable, serial, text } from "drizzle-orm/pg-core";
+import { boolean, bigint, integer, numeric, pgTable, serial, text } from "drizzle-orm/pg-core";
 
 export const users = pgTable("users", {
   id: serial("id").primaryKey(),
   waNumber: text("wa_number").notNull().unique(),
   publicKey: text("public_key").notNull(),
   secret: text("secret").notNull(),
+  // Whether the on-chain account has been funded + given its trustlines (done lazily after
+  // sign-up so the OTP isn't blocked on it).
+  activated: boolean("activated").notNull().default(false),
   createdAt: bigint("created_at", { mode: "number" }).notNull(),
   pinHash: text("pin_hash"),
   pinAttempts: integer("pin_attempts").notNull().default(0),

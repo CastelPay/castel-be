@@ -33,7 +33,7 @@ import {
   rateLimit,
 } from "./lib/limits";
 import { cashouts, transactions, users } from "./db/schema";
-import { createWallet, walletBalances } from "./services/custody";
+import { activateWallet, newWallet, walletBalances } from "./services/custody";
 import { quoteUsdcToCidr, swapUsdcToCidr } from "./services/fx";
 import { usdIdrMid } from "./lib/rates";
 
@@ -67,17 +67,51 @@ const findUser = async (waNumber: string) =>
 
 type User = NonNullable<Awaited<ReturnType<typeof findUser>>>;
 
+// A row with a fresh keypair, created instantly. The on-chain account is funded + trustlined
+// later by ensureActivated, so sign-up (and its OTP) never waits ~15s on friendbot.
 async function ensureUser(waNumber: string): Promise<User> {
   const existing = await findUser(waNumber);
   if (existing) return existing;
-  const wallet = await createWallet();
+  const wallet = newWallet();
   await db.insert(users).values({
     waNumber,
     publicKey: wallet.publicKey,
     secret: wallet.secret,
+    activated: false,
     createdAt: Date.now(),
   });
   return (await findUser(waNumber))!;
+}
+
+// Fund + trustline the account, once, before it is used on-chain. Concurrent callers (the
+// background kick-off at sign-up and the first real request) share one activation.
+const activating = new Map<number, Promise<void>>();
+
+function activate(user: User): Promise<void> {
+  let p = activating.get(user.id);
+  if (!p) {
+    p = (async () => {
+      const fresh = await findUser(user.waNumber);
+      if (fresh?.activated) return;
+      await activateWallet(user.secret);
+      await db.update(users).set({ activated: true }).where(eq(users.id, user.id));
+    })().finally(() => activating.delete(user.id));
+    activating.set(user.id, p);
+  }
+  return p;
+}
+
+async function ensureActivated(user: User): Promise<void> {
+  if (user.activated) return;
+  await activate(user);
+}
+
+/** findUser for routes that touch the chain: guarantees the account is funded + trustlined. */
+async function walletUser(waNumber: string): Promise<User | null> {
+  const user = await findUser(waNumber);
+  if (!user) return null;
+  await ensureActivated(user);
+  return user;
 }
 
 /** Spending needs the PIN — a hijacked WhatsApp session must not be able to move money. */
@@ -143,6 +177,8 @@ app.post("/auth/request", async (c) => {
   if (!sent && !process.env.LOG_OTP)
     return c.json({ error: "couldn't reach that number on WhatsApp — message the bot first" }, 502);
 
+  // Warm the on-chain account in the background while the user reads the code and types it in.
+  void ensureActivated(user).catch(() => {});
   return c.json({ sent: true });
 });
 
@@ -182,6 +218,7 @@ app.post("/auth/exchange", async (c) => {
   const wa = linkToken ? verifyToken(String(linkToken), "link") : null;
   if (!wa) return c.json({ error: "invalid or expired link" }, 401);
   const user = await ensureUser(wa);
+  void ensureActivated(user).catch(() => {});
   return c.json({
     token: signToken(wa, "session", SESSION_TTL_MS),
     waNumber: wa,
@@ -214,7 +251,7 @@ app.get("/me/limits", requireAuth, async (c) => c.json(await limitsFor(c.get("wa
 // Everything the deposit sheet needs: the Stellar address to receive USDC at, the USDC
 // asset to send, and whether a card is already on file for one-tap top-ups.
 app.get("/me/wallet", requireAuth, async (c) => {
-  const user = await findUser(c.get("wa"));
+  const user = await walletUser(c.get("wa"));
   if (!user) return c.json({ error: "not found" }, 404);
   const usdc = USDC();
   const card = stripe && user.stripeCustomerId ? await savedCard(user.stripeCustomerId) : null;
@@ -228,7 +265,7 @@ app.get("/me/wallet", requireAuth, async (c) => {
 });
 
 app.get("/me/balance", requireAuth, async (c) => {
-  const user = await findUser(c.get("wa"));
+  const user = await walletUser(c.get("wa"));
   if (!user) return c.json({ error: "not found" }, 404);
   return c.json(await walletBalances(user.publicKey));
 });
@@ -251,7 +288,7 @@ app.post("/fund", requireAuth, async (c) => {
   const amount = Number(usdc);
   if (!Number.isFinite(amount) || amount <= 0 || amount > DEMO_FUND_MAX)
     return c.json({ error: `usdc must be between 0 and ${DEMO_FUND_MAX}` }, 400);
-  const user = await findUser(c.get("wa"));
+  const user = await walletUser(c.get("wa"));
   if (!user) return c.json({ error: "not found" }, 404);
   const treasury = Keypair.fromSecret(process.env.TREASURY_SECRET!);
   await submit(treasury, (b) =>
@@ -285,6 +322,7 @@ async function savedCard(customerId: string): Promise<Stripe.PaymentMethod | nul
  * session or payment-intent id), so a repeated confirm never double-credits.
  */
 async function creditUsdAsRupiah(user: User, waNumber: string, usd: number, txHash: string) {
+  await ensureActivated(user);
   const already = (await db.select().from(transactions).where(eq(transactions.hash, txHash)))[0];
   if (already) return { credited: false, usd, balances: await walletBalances(user.publicKey) };
 
@@ -436,7 +474,7 @@ app.post("/deposit/confirm", requireAuth, async (c) => {
 // converts whatever USDC has arrived into rupiah on the DEX. No card involved.
 app.post("/deposit/usdc/convert", requireAuth, async (c) => {
   const waNumber = c.get("wa");
-  const user = await findUser(waNumber);
+  const user = await walletUser(waNumber);
   if (!user) return c.json({ error: "not found" }, 404);
 
   const usdc = Number((await walletBalances(user.publicKey)).USDC);
@@ -527,7 +565,7 @@ app.post("/pay/quick/confirm", requireAuth, async (c) => {
   if (session.metadata?.waNumber !== waNumber)
     return c.json({ error: "session does not belong to you" }, 403);
 
-  const user = await findUser(waNumber);
+  const user = await walletUser(waNumber);
   if (!user) return c.json({ error: "not found" }, 404);
 
   const usd = Number(session.metadata?.usd ?? 0);
@@ -608,7 +646,7 @@ app.post("/fx/swap", requireAuth, async (c) => {
   const { usdc } = await c.req.json();
   const amount = Number(usdc);
   if (!Number.isFinite(amount) || amount <= 0) return c.json({ error: "usdc required" }, 400);
-  const user = await findUser(waNumber);
+  const user = await walletUser(waNumber);
   if (!user) return c.json({ error: "not found" }, 404);
 
   const { hash, quote } = await swapUsdcToCidr(Keypair.fromSecret(user.secret), amount);
@@ -626,7 +664,7 @@ app.post("/qris/decode", async (c) => {
 app.post("/pay", requireAuth, async (c) => {
   const waNumber = c.get("wa");
   const { payload, amount, pin } = await c.req.json();
-  const user = await findUser(waNumber);
+  const user = await walletUser(waNumber);
   if (!user) return c.json({ error: "not found" }, 404);
 
   const pinError = await checkPin(user, pin);
@@ -683,7 +721,7 @@ const agentFee = (amountIdr: number) => Math.round((amountIdr * CASHOUT_FEE_BPS)
 app.post("/cashout/request", requireAuth, async (c) => {
   const waNumber = c.get("wa");
   const { amountIdr, pin } = await c.req.json();
-  const user = await findUser(waNumber);
+  const user = await walletUser(waNumber);
   if (!user) return c.json({ error: "not found" }, 404);
 
   const pinError = await checkPin(user, pin);
