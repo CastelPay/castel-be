@@ -7,7 +7,7 @@ import { logger } from "hono/logger";
 import twilio from "twilio";
 import Stripe from "stripe";
 import { db } from "./db";
-import { cIDR, submit, USDC } from "./lib/stellar";
+import { cIDR, circleUSDC, CIRCLE_USDC_ISSUER, submit, USDC } from "./lib/stellar";
 import { parseQris } from "./lib/qris";
 import { settleToMerchant, xenditEnabled, type Settlement } from "./lib/xendit";
 import { escrowLock, escrowRelease, makePickup } from "./lib/soroban";
@@ -33,9 +33,15 @@ import {
   rateLimit,
 } from "./lib/limits";
 import { cashouts, transactions, users } from "./db/schema";
-import { activateWallet, newWallet, walletBalances } from "./services/custody";
+import {
+  activateWallet,
+  circleUsdcBalance,
+  newWallet,
+  trustCircleUsdc,
+  walletBalances,
+} from "./services/custody";
 import { quoteUsdcToCidr, swapUsdcToCidr } from "./services/fx";
-import { usdIdrMid } from "./lib/rates";
+import { MONEY_CHANGER_MARKDOWN, usdIdrMid } from "./lib/rates";
 
 const app = new Hono<Vars>();
 const WEB = process.env.WEB_WALLET_URL ?? "http://localhost:3000";
@@ -495,6 +501,71 @@ app.post("/deposit/usdc/convert", requireAuth, async (c) => {
     cidr: q.cidrOut,
     savingsIdr: q.savingsIdr,
     hash,
+    balances: await walletBalances(user.publicKey),
+  });
+});
+
+// --- Real USDC on-ramp: connect a Stellar wallet (Freighter) and send Circle testnet USDC ---
+
+/** Castel's margin on the crypto on-ramp, applied against the live mid — same as the DEX book. */
+const CIRCLE_SPREAD_BPS = 30;
+
+// Prepare the account to receive Circle USDC: ensure its trustline exists (older accounts and
+// new ones alike), and hand back the address + asset the wallet should send to.
+app.post("/deposit/circle/prepare", requireAuth, async (c) => {
+  const user = await walletUser(c.get("wa"));
+  if (!user) return c.json({ error: "not found" }, 404);
+  await trustCircleUsdc(user.secret);
+  return c.json({
+    publicKey: user.publicKey,
+    asset: { code: "USDC", issuer: CIRCLE_USDC_ISSUER },
+  });
+});
+
+// Convert Circle USDC that has arrived at the user's Castel account into rupiah. Anchor-style:
+// the treasury takes the USDC as reserve and cIDR is issued at the reference rate — no DEX,
+// because a Circle-USDC/cIDR order book can't be seeded from a rate-limited faucet.
+app.post("/deposit/circle/convert", requireAuth, async (c) => {
+  const waNumber = c.get("wa");
+  const user = await findUser(waNumber);
+  if (!user) return c.json({ error: "not found" }, 404);
+
+  const usdc = Number(await circleUsdcBalance(user.publicKey));
+  if (usdc <= 0)
+    return c.json({ error: "no USDC received yet — send USDC to your Castel address first" }, 400);
+
+  const mid = (await usdIdrMid()).rate;
+  const cidrOut = Math.round((usdc * mid * (10_000 - CIRCLE_SPREAD_BPS)) / 10_000);
+  const savingsIdr = cidrOut - usdc * (mid - MONEY_CHANGER_MARKDOWN);
+
+  const limit = await checkDepositLimit(waNumber, cidrOut);
+  if (!limit.ok) return c.json({ error: limit.error }, 403);
+
+  // Issue cIDR to the user (distributor holds the cIDR float)...
+  const distributor = Keypair.fromSecret(process.env.DISTRIBUTOR_SECRET!);
+  await submit(distributor, (b) =>
+    b.addOperation(
+      Operation.payment({ destination: user.publicKey, asset: cIDR(), amount: cidrOut.toFixed(7) }),
+    ),
+  );
+  // ...and sweep the USDC into the treasury as the reserve backing it.
+  const sweep = await submit(Keypair.fromSecret(user.secret), (b) =>
+    b.addOperation(
+      Operation.payment({
+        destination: process.env.TREASURY_PUBLIC!,
+        asset: circleUSDC(),
+        amount: usdc.toFixed(7),
+      }),
+    ),
+  );
+
+  await recordTx(waNumber, "deposit", `Added ${rupiah(cidrOut)} (USDC)`, cidrOut, "in", sweep.hash);
+  return c.json({
+    credited: true,
+    usdc,
+    cidr: cidrOut,
+    savingsIdr,
+    hash: sweep.hash,
     balances: await walletBalances(user.publicKey),
   });
 });

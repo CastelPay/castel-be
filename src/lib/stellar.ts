@@ -26,6 +26,15 @@ function envAsset(codeKey: string, issuerKey: string, defCode: string): Asset {
 export const cIDR = (): Asset => envAsset("CIDR_ASSET_CODE", "CIDR_ISSUER_PUBLIC", "cIDR");
 export const USDC = (): Asset => envAsset("USDC_ASSET_CODE", "USDC_ISSUER", "USDC");
 
+/**
+ * Circle's real USDC on Stellar testnet — what a crypto-native user actually holds and sends
+ * from their own wallet. Distinct from the self-issued test USDC above, which is the internal
+ * rail for the card flow. Issuer confirmed live on testnet (home_domain centre.io).
+ */
+export const CIRCLE_USDC_ISSUER =
+  process.env.CIRCLE_USDC_ISSUER ?? "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+export const circleUSDC = (): Asset => new Asset("USDC", CIRCLE_USDC_ISSUER);
+
 /** Fund a testnet account from Friendbot (idempotent-ish). */
 export async function fundTestnet(publicKey: string): Promise<void> {
   const res = await fetch(`https://friendbot.stellar.org/?addr=${publicKey}`);

@@ -1,5 +1,5 @@
 import { Keypair, Operation } from "@stellar/stellar-sdk";
-import { balanceOf, cIDR, fundTestnet, submit, USDC } from "../lib/stellar";
+import { balanceOf, cIDR, circleUSDC, fundTestnet, horizon, submit, USDC } from "../lib/stellar";
 
 export type Wallet = { publicKey: string; secret: string };
 
@@ -36,4 +36,25 @@ export async function walletBalances(publicKey: string) {
     cIDR: await balanceOf(publicKey, cIDR()),
     USDC: await balanceOf(publicKey, USDC()),
   };
+}
+
+export const circleUsdcBalance = (publicKey: string) => balanceOf(publicKey, circleUSDC());
+
+/** True if the account already opted into Circle USDC. */
+export async function hasCircleTrust(publicKey: string): Promise<boolean> {
+  const asset = circleUSDC();
+  const acc = await horizon.loadAccount(publicKey);
+  return acc.balances.some(
+    (b: any) => b.asset_code === asset.getCode() && b.asset_issuer === asset.getIssuer(),
+  );
+}
+
+/**
+ * Opt the account into Circle USDC so it can receive it — added lazily (only crypto-native
+ * users need it). Skips if the trustline already exists.
+ */
+export async function trustCircleUsdc(secret: string): Promise<void> {
+  const kp = Keypair.fromSecret(secret);
+  if (await hasCircleTrust(kp.publicKey())) return;
+  await submit(kp, (b) => b.addOperation(Operation.changeTrust({ asset: circleUSDC() })));
 }
