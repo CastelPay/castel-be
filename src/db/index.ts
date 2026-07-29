@@ -40,6 +40,7 @@ for (const col of [
   "otp_hash TEXT",
   "otp_expires BIGINT",
   "otp_attempts INTEGER NOT NULL DEFAULT 0",
+  "stripe_customer_id TEXT",
 ]) {
   await sql.unsafe(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ${col}`);
 }

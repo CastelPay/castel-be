@@ -11,6 +11,7 @@ export const users = pgTable("users", {
   otpHash: text("otp_hash"),
   otpExpires: bigint("otp_expires", { mode: "number" }),
   otpAttempts: integer("otp_attempts").notNull().default(0),
+  stripeCustomerId: text("stripe_customer_id"),
 });
 
 export const transactions = pgTable("transactions", {

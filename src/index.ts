@@ -211,6 +211,22 @@ app.post("/me/pin", requireAuth, async (c) => {
 
 app.get("/me/limits", requireAuth, async (c) => c.json(await limitsFor(c.get("wa"))));
 
+// Everything the deposit sheet needs: the Stellar address to receive USDC at, the USDC
+// asset to send, and whether a card is already on file for one-tap top-ups.
+app.get("/me/wallet", requireAuth, async (c) => {
+  const user = await findUser(c.get("wa"));
+  if (!user) return c.json({ error: "not found" }, 404);
+  const usdc = USDC();
+  const card = stripe && user.stripeCustomerId ? await savedCard(user.stripeCustomerId) : null;
+  return c.json({
+    publicKey: user.publicKey,
+    usdc: { code: usdc.getCode(), issuer: usdc.getIssuer() },
+    balances: await walletBalances(user.publicKey),
+    hasSavedCard: !!card,
+    cardLast4: card?.card?.last4 ?? null,
+  });
+});
+
 app.get("/me/balance", requireAuth, async (c) => {
   const user = await findUser(c.get("wa"));
   if (!user) return c.json({ error: "not found" }, 404);
@@ -248,6 +264,63 @@ app.post("/fund", requireAuth, async (c) => {
 
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
+/** Reuse one Stripe customer per user so the card saved on the first top-up can be charged again. */
+async function stripeCustomerFor(user: User): Promise<string> {
+  if (user.stripeCustomerId) return user.stripeCustomerId;
+  const customer = await stripe!.customers.create({
+    metadata: { waNumber: user.waNumber },
+  });
+  await db.update(users).set({ stripeCustomerId: customer.id }).where(eq(users.id, user.id));
+  return customer.id;
+}
+
+async function savedCard(customerId: string): Promise<Stripe.PaymentMethod | null> {
+  const pms = await stripe!.paymentMethods.list({ customer: customerId, type: "card", limit: 1 });
+  return pms.data[0] ?? null;
+}
+
+/**
+ * The tourist bought rupiah, not crypto. Deliver the paid USD as USDC then swap it to cIDR
+ * on the DEX, so the balance simply reads in rupiah. `txHash` keys idempotency (Stripe
+ * session or payment-intent id), so a repeated confirm never double-credits.
+ */
+async function creditUsdAsRupiah(user: User, waNumber: string, usd: number, txHash: string) {
+  const already = (await db.select().from(transactions).where(eq(transactions.hash, txHash)))[0];
+  if (already) return { credited: false, usd, balances: await walletBalances(user.publicKey) };
+
+  const treasury = Keypair.fromSecret(process.env.TREASURY_SECRET!);
+  await submit(treasury, (b) =>
+    b.addOperation(
+      Operation.payment({ destination: user.publicKey, asset: USDC(), amount: String(usd) }),
+    ),
+  );
+
+  const userKp = Keypair.fromSecret(user.secret);
+  try {
+    const { hash, quote } = await swapUsdcToCidr(userKp, usd);
+    await recordTx(waNumber, "deposit", `Added ${rupiah(quote.cidrOut)}`, quote.cidrOut, "in", txHash);
+    return {
+      credited: true,
+      usd,
+      cidr: quote.cidrOut,
+      rate: quote.rate,
+      savingsIdr: quote.savingsIdr,
+      hash,
+      balances: await walletBalances(user.publicKey),
+    };
+  } catch (e) {
+    // The card already cleared, so the money must not vanish: keep it as USDC and let
+    // the wallet offer a manual exchange.
+    await recordTx(waNumber, "deposit", `Added $${usd} (exchange pending)`, 0, "in", txHash);
+    return {
+      credited: true,
+      usd,
+      exchangeFailed: (e as Error).message,
+      balances: await walletBalances(user.publicKey),
+    };
+  }
+}
+
 app.post("/deposit/create", requireAuth, async (c) => {
   if (!stripe) return c.json({ error: "stripe not configured" }, 500);
   const waNumber = c.get("wa");
@@ -266,8 +339,12 @@ app.post("/deposit/create", requireAuth, async (c) => {
   if (!limit.ok) return c.json({ error: limit.error }, 403);
   if (!quote) return c.json({ error: "that amount is too large to exchange right now" }, 400);
 
+  // Save the card to a reusable customer so later top-ups need no card entry (see /deposit/charge).
+  const customer = await stripeCustomerFor(user);
   const session = await stripe.checkout.sessions.create({
     mode: "payment",
+    customer,
+    payment_intent_data: { setup_future_usage: "off_session" },
     line_items: [
       {
         quantity: 1,
@@ -289,6 +366,47 @@ app.post("/deposit/create", requireAuth, async (c) => {
   return c.json({ url: session.url });
 });
 
+// One-tap top-up once a card is on file: charge the saved card off-session, no redirect.
+app.post("/deposit/charge", requireAuth, async (c) => {
+  if (!stripe) return c.json({ error: "stripe not configured" }, 500);
+  const waNumber = c.get("wa");
+  const { usd } = await c.req.json();
+  const amount = Number(usd);
+  if (!amount || amount <= 0) return c.json({ error: "amount required" }, 400);
+
+  const user = await findUser(waNumber);
+  if (!user) return c.json({ error: "not found" }, 404);
+  if (!user.stripeCustomerId) return c.json({ error: "no saved card" }, 409);
+  const card = await savedCard(user.stripeCustomerId);
+  if (!card) return c.json({ error: "no saved card" }, 409);
+
+  const quote = await quoteUsdcToCidr(amount).catch(() => null);
+  const idrValue = quote?.cidrOut ?? amount * (await usdIdrMid()).rate;
+  const limit = await checkDepositLimit(waNumber, idrValue);
+  if (!limit.ok) return c.json({ error: limit.error }, 403);
+  if (!quote) return c.json({ error: "that amount is too large to exchange right now" }, 400);
+
+  let intent: Stripe.PaymentIntent;
+  try {
+    intent = await stripe.paymentIntents.create({
+      amount: Math.round(amount * 100),
+      currency: "usd",
+      customer: user.stripeCustomerId,
+      payment_method: card.id,
+      off_session: true,
+      confirm: true,
+      metadata: { waNumber, usd: String(amount) },
+    });
+  } catch (e) {
+    // A card that now needs re-authentication (SCA) can't be charged silently — fall back to Checkout.
+    return c.json({ error: "card needs re-entry", useCheckout: true, detail: (e as Error).message }, 402);
+  }
+  if (intent.status !== "succeeded")
+    return c.json({ error: "card needs re-entry", useCheckout: true, status: intent.status }, 402);
+
+  return c.json(await creditUsdAsRupiah(user, waNumber, amount, intent.id));
+});
+
 app.post("/deposit/confirm", requireAuth, async (c) => {
   if (!stripe) return c.json({ error: "stripe not configured" }, 500);
   const waNumber = c.get("wa");
@@ -304,48 +422,43 @@ app.post("/deposit/confirm", requireAuth, async (c) => {
   const user = await findUser(waNumber);
   if (!user) return c.json({ error: "not found" }, 404);
 
-  const usd = Number(session.metadata?.usd ?? (session.amount_total ?? 0) / 100);
-  const balances = await walletBalances(user.publicKey);
-
-  // Idempotent: the confirm redirect can fire more than once — credit only once per session.
-  const already = (
-    await db.select().from(transactions).where(eq(transactions.hash, sessionId))
-  )[0];
-  if (already) return c.json({ credited: false, usd, balances });
-
-  const treasury = Keypair.fromSecret(process.env.TREASURY_SECRET!);
-  await submit(treasury, (b) =>
-    b.addOperation(
-      Operation.payment({ destination: user.publicKey, asset: USDC(), amount: String(usd) }),
-    ),
-  );
-
-  // The tourist bought rupiah, not crypto. USDC is a rail, so it is converted here
-  // rather than left on the balance for them to reason about.
-  const userKp = Keypair.fromSecret(user.secret);
-  try {
-    const { hash, quote } = await swapUsdcToCidr(userKp, usd);
-    await recordTx(waNumber, "deposit", `Added ${rupiah(quote.cidrOut)}`, quote.cidrOut, "in", sessionId);
-    return c.json({
-      credited: true,
-      usd,
-      cidr: quote.cidrOut,
-      rate: quote.rate,
-      savingsIdr: quote.savingsIdr,
-      hash,
-      balances: await walletBalances(user.publicKey),
-    });
-  } catch (e) {
-    // The card already cleared, so the money must not vanish: keep it as USDC and let
-    // the wallet offer a manual exchange.
-    await recordTx(waNumber, "deposit", `Added $${usd} (exchange pending)`, 0, "in", sessionId);
-    return c.json({
-      credited: true,
-      usd,
-      exchangeFailed: (e as Error).message,
-      balances: await walletBalances(user.publicKey),
-    });
+  // Remember the customer so subsequent top-ups can reuse the card Checkout just saved.
+  if (session.customer && !user.stripeCustomerId) {
+    const id = typeof session.customer === "string" ? session.customer : session.customer.id;
+    await db.update(users).set({ stripeCustomerId: id }).where(eq(users.id, user.id));
   }
+
+  const usd = Number(session.metadata?.usd ?? (session.amount_total ?? 0) / 100);
+  return c.json(await creditUsdAsRupiah(user, waNumber, usd, sessionId));
+});
+
+// USDC on-ramp for crypto-native users: they send USDC to their Castel address, then this
+// converts whatever USDC has arrived into rupiah on the DEX. No card involved.
+app.post("/deposit/usdc/convert", requireAuth, async (c) => {
+  const waNumber = c.get("wa");
+  const user = await findUser(waNumber);
+  if (!user) return c.json({ error: "not found" }, 404);
+
+  const usdc = Number((await walletBalances(user.publicKey)).USDC);
+  if (usdc <= 0)
+    return c.json({ error: "no USDC received yet — send USDC to your address, then try again" }, 400);
+
+  const quote = await quoteUsdcToCidr(usdc).catch(() => null);
+  const idrValue = quote?.cidrOut ?? usdc * (await usdIdrMid()).rate;
+  const limit = await checkDepositLimit(waNumber, idrValue);
+  if (!limit.ok) return c.json({ error: limit.error }, 403);
+  if (!quote) return c.json({ error: "that amount is too large to exchange right now" }, 400);
+
+  const { hash, quote: q } = await swapUsdcToCidr(Keypair.fromSecret(user.secret), usdc);
+  await recordTx(waNumber, "deposit", `Added ${rupiah(q.cidrOut)} (USDC)`, q.cidrOut, "in", hash);
+  return c.json({
+    credited: true,
+    usdc,
+    cidr: q.cidrOut,
+    savingsIdr: q.savingsIdr,
+    hash,
+    balances: await walletBalances(user.publicKey),
+  });
 });
 
 // Over-fund the card charge by this much so the on-chain swap reliably clears the bill
