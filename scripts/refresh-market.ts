@@ -17,8 +17,10 @@ import { usdIdrMid } from "../src/lib/rates";
 /** Castel's margin, applied either side of mid. This is the revenue line. */
 const SPREAD_BPS = 30;
 
-const CIDR_DEPTH = "50000000";
-const USDC_DEPTH = "3000";
+// Deep enough that a demo's worth of top-ups can't drain the cIDR side back to "no path".
+// The distributor holds ~900M cIDR, so a 500M offer leaves ample buffer.
+const CIDR_DEPTH = "500000000";
+const USDC_DEPTH = "10000";
 
 type Offer = { id: string; selling: { asset_code?: string; asset_type: string } };
 
