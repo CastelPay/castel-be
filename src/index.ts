@@ -647,14 +647,11 @@ app.post("/pay/quick/create", requireAuth, async (c) => {
   const spend = await checkSpendLimit(waNumber, amountIdr);
   if (!spend.ok) return c.json({ error: spend.error }, 403);
 
-  // Size the charge from the rate the swap will ACTUALLY execute at (the order book), not
-  // the external mid used for the savings comparison — the two can diverge, and using the
-  // mid would under-fund the swap and leave the merchant unpaid. Probe with a reference
-  // amount to read the DEX rate, then over-fund by the buffer.
-  const probe = await quoteUsdcToCidr(10).catch(() => null);
-  if (!probe) return c.json({ error: "can't price this right now — try again" }, 503);
-  const dexRate = probe.rate;
-  const usd = Math.ceil((amountIdr / dexRate) * (1 + QUICKPAY_BUFFER) * 100) / 100;
+  // Size the charge off the reference rate the card credit executes at (see creditUsdAsRupiah),
+  // over-funded by the buffer so rounding can't leave the bill short. No DEX dependency.
+  const mid = (await usdIdrMid()).rate;
+  const refRate = (mid * (10_000 - REFERENCE_SPREAD_BPS)) / 10_000;
+  const usd = Math.ceil((amountIdr / refRate) * (1 + QUICKPAY_BUFFER) * 100) / 100;
 
   const dep = await checkDepositLimit(waNumber, amountIdr);
   if (!dep.ok) return c.json({ error: dep.error }, 403);
@@ -709,14 +706,16 @@ app.post("/pay/quick/confirm", requireAuth, async (c) => {
     await db.select().from(transactions).where(eq(transactions.hash, sessionId))
   )[0];
   if (!charged) {
-    const treasury = Keypair.fromSecret(process.env.TREASURY_SECRET!);
-    await submit(treasury, (b) =>
+    // Direct-rupiah: the card money is the reserve, so issue cIDR straight to the user at the
+    // reference rate — no USDC minted, no DEX swap that a thin book could fail.
+    const cidrOut = refCidr(usd, (await usdIdrMid()).rate);
+    const distributor = Keypair.fromSecret(process.env.DISTRIBUTOR_SECRET!);
+    await submit(distributor, (b) =>
       b.addOperation(
-        Operation.payment({ destination: user.publicKey, asset: USDC(), amount: String(usd) }),
+        Operation.payment({ destination: user.publicKey, asset: cIDR(), amount: cidrOut.toFixed(7) }),
       ),
     );
     await recordTx(waNumber, "deposit", `Card charge · ${info.merchantName}`, 0, "in", sessionId);
-    await swapUsdcToCidr(userKp, usd);
   }
 
   // The merchant-payment leg has its own marker keyed on the same session, so a retry
