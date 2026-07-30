@@ -44,6 +44,36 @@ async function lastStored(): Promise<{ rate: number; at: number } | null> {
   }
 }
 
+/**
+ * Live XLM/USD spot, for the native-XLM on-ramp. Coinbase's open spot endpoint — no key,
+ * no rate limit that a per-hour cache would trip. Cached and fallback-guarded exactly like
+ * the USD/IDR mid, so a flaky price feed never strands a deposit or misprices wildly.
+ */
+const XLM_SOURCE = "https://api.coinbase.com/v2/prices/XLM-USD/spot";
+const XLM_FALLBACK_USD = 0.12;
+let xlmMemo: { rate: number; at: number } | null = null;
+
+export async function xlmUsd(): Promise<Mid> {
+  if (xlmMemo && Date.now() - xlmMemo.at < TTL_MS) {
+    return { rate: xlmMemo.rate, source: "cached", at: xlmMemo.at };
+  }
+  try {
+    const res = await fetch(XLM_SOURCE, { signal: AbortSignal.timeout(5000) });
+    const data = (await res.json()) as { data?: { amount?: string } };
+    const rate = Number(data?.data?.amount);
+    // A plausibility band: XLM has never been below a cent or above a few dollars.
+    if (Number.isFinite(rate) && rate > 0.001 && rate < 100) {
+      xlmMemo = { rate, at: Date.now() };
+      return { rate, source: "live", at: xlmMemo.at };
+    }
+  } catch {
+    // fall through to the last known / fallback
+  }
+  if (xlmMemo) return { rate: xlmMemo.rate, source: "cached", at: xlmMemo.at };
+  console.error("XLM/USD unavailable from Coinbase — quoting on the fallback rate");
+  return { rate: XLM_FALLBACK_USD, source: "fallback", at: Date.now() };
+}
+
 export async function usdIdrMid(): Promise<Mid> {
   if (memo && Date.now() - memo.at < TTL_MS) {
     return { rate: memo.rate, source: "cached", at: memo.at };

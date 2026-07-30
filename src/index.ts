@@ -7,7 +7,7 @@ import { logger } from "hono/logger";
 import twilio from "twilio";
 import Stripe from "stripe";
 import { db } from "./db";
-import { cIDR, circleUSDC, CIRCLE_USDC_ISSUER, submit, USDC } from "./lib/stellar";
+import { cIDR, circleUSDC, CIRCLE_USDC_ISSUER, horizon, submit, USDC } from "./lib/stellar";
 import { parseQris } from "./lib/qris";
 import { settleToMerchant, xenditEnabled, type Settlement } from "./lib/xendit";
 import { escrowLock, escrowRelease, makePickup } from "./lib/soroban";
@@ -41,7 +41,7 @@ import {
   walletBalances,
 } from "./services/custody";
 import { quoteUsdcToCidr, swapUsdcToCidr } from "./services/fx";
-import { MONEY_CHANGER_MARKDOWN, usdIdrMid } from "./lib/rates";
+import { MONEY_CHANGER_MARKDOWN, usdIdrMid, xlmUsd } from "./lib/rates";
 
 const app = new Hono<Vars>();
 const WEB = process.env.WEB_WALLET_URL ?? "http://localhost:3000";
@@ -566,6 +566,70 @@ app.post("/deposit/circle/convert", requireAuth, async (c) => {
     cidr: cidrOut,
     savingsIdr,
     hash: sweep.hash,
+    balances: await walletBalances(user.publicKey),
+  });
+});
+
+// --- Native XLM on-ramp: connect a Stellar wallet (Freighter) and send real testnet XLM ---
+// XLM needs no trustline, and an already-funded account can't be "swept" (it holds friendbot
+// XLM), so instead the wallet pays XLM straight to the treasury and we verify that payment by
+// its hash — then credit cIDR at the live XLM→USD→IDR reference rate. Showcases native Stellar.
+const XLM_SPREAD_BPS = 30;
+
+app.post("/deposit/xlm/prepare", requireAuth, async (c) => {
+  const user = await walletUser(c.get("wa"));
+  if (!user) return c.json({ error: "not found" }, 404);
+  return c.json({ destination: process.env.TREASURY_PUBLIC! });
+});
+
+app.post("/deposit/xlm/convert", requireAuth, async (c) => {
+  const waNumber = c.get("wa");
+  const user = await walletUser(waNumber);
+  if (!user) return c.json({ error: "not found" }, 404);
+
+  const { hash } = await c.req.json().catch(() => ({}));
+  if (!hash || typeof hash !== "string") return c.json({ error: "hash required" }, 400);
+
+  // One credit per on-chain payment — a replayed hash never double-credits.
+  const already = (await db.select().from(transactions).where(eq(transactions.hash, hash)))[0];
+  if (already) return c.json({ error: "this deposit was already credited" }, 409);
+
+  // Verify on-chain: the hash must carry a native-XLM payment into the treasury.
+  const treasuryPub = process.env.TREASURY_PUBLIC!;
+  let xlm = 0;
+  try {
+    const ops = await horizon.operations().forTransaction(hash).limit(50).call();
+    const pay = ops.records.find(
+      (o: any) => o.type === "payment" && o.asset_type === "native" && o.to === treasuryPub,
+    ) as any;
+    xlm = pay ? Number(pay.amount) : 0;
+  } catch {
+    return c.json({ error: "couldn't find that transaction yet — try again in a moment" }, 400);
+  }
+  if (xlm <= 0) return c.json({ error: "no XLM payment to Castel found in that transaction" }, 400);
+
+  const usdValue = xlm * (await xlmUsd()).rate;
+  const mid = (await usdIdrMid()).rate;
+  const cidrOut = Math.round((usdValue * mid * (10_000 - XLM_SPREAD_BPS)) / 10_000);
+  const savingsIdr = cidrOut - usdValue * (mid - MONEY_CHANGER_MARKDOWN);
+
+  const limit = await checkDepositLimit(waNumber, cidrOut);
+  if (!limit.ok) return c.json({ error: limit.error }, 403);
+
+  // The XLM is already in the treasury (the reserve); issue the matching cIDR to the user.
+  const distributor = Keypair.fromSecret(process.env.DISTRIBUTOR_SECRET!);
+  await submit(distributor, (b) =>
+    b.addOperation(
+      Operation.payment({ destination: user.publicKey, asset: cIDR(), amount: cidrOut.toFixed(7) }),
+    ),
+  );
+  await recordTx(waNumber, "deposit", `Added ${rupiah(cidrOut)} (XLM)`, cidrOut, "in", hash);
+  return c.json({
+    credited: true,
+    xlm,
+    cidr: cidrOut,
+    savingsIdr,
+    hash,
     balances: await walletBalances(user.publicKey),
   });
 });
