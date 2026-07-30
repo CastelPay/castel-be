@@ -40,10 +40,16 @@ import {
   trustCircleUsdc,
   walletBalances,
 } from "./services/custody";
-import { quoteUsdcToCidr, swapUsdcToCidr } from "./services/fx";
+import { buildQuote, quoteUsdcToCidr, swapUsdcToCidr } from "./services/fx";
 import { MONEY_CHANGER_MARKDOWN, usdIdrMid, xlmUsd } from "./lib/rates";
 
 const app = new Hono<Vars>();
+
+// Castel's margin on any reference-rate conversion (the fiat card rail, the crypto on-ramps,
+// and where the DEX market maker posts its offers). cIDR out for a given USD in.
+const REFERENCE_SPREAD_BPS = 30;
+const refCidr = (usd: number, mid: number) =>
+  Math.round((usd * mid * (10_000 - REFERENCE_SPREAD_BPS)) / 10_000);
 const WEB = process.env.WEB_WALLET_URL ?? "http://localhost:3000";
 
 app.use("*", logger());
@@ -276,10 +282,13 @@ app.get("/me/balance", requireAuth, async (c) => {
   return c.json(await walletBalances(user.publicKey));
 });
 
+// A preview/estimate. Priced off the reference rate (what the market maker pegs the book to),
+// so it always resolves — no dependency on live DEX depth just to show a number.
 app.get("/fx/quote", async (c) => {
   const usdc = Number(c.req.query("usdc") ?? "0");
   if (!usdc) return c.json({ error: "usdc query param required" }, 400);
-  return c.json(await quoteUsdcToCidr(usdc));
+  const mid = await usdIdrMid();
+  return c.json(buildQuote(usdc, refCidr(usdc, mid.rate), mid));
 });
 
 // Testnet demo faucet. Anyone can self-register a WhatsApp number, so without the
@@ -323,46 +332,36 @@ async function savedCard(customerId: string): Promise<Stripe.PaymentMethod | nul
 }
 
 /**
- * The tourist bought rupiah, not crypto. Deliver the paid USD as USDC then swap it to cIDR
- * on the DEX, so the balance simply reads in rupiah. `txHash` keys idempotency (Stripe
- * session or payment-intent id), so a repeated confirm never double-credits.
+ * The tourist bought rupiah, not crypto. The card money is the reserve (held as fiat at the
+ * payment processor), so we issue the matching cIDR straight to the user at the reference
+ * rate — no DEX, nothing to strand, and the balance simply reads in rupiah. `txHash` keys
+ * idempotency (Stripe session or payment-intent id), so a repeated confirm never double-credits.
  */
 async function creditUsdAsRupiah(user: User, waNumber: string, usd: number, txHash: string) {
   await ensureActivated(user);
   const already = (await db.select().from(transactions).where(eq(transactions.hash, txHash)))[0];
   if (already) return { credited: false, usd, balances: await walletBalances(user.publicKey) };
 
-  const treasury = Keypair.fromSecret(process.env.TREASURY_SECRET!);
-  await submit(treasury, (b) =>
+  const mid = (await usdIdrMid()).rate;
+  const cidrOut = refCidr(usd, mid);
+  const savingsIdr = cidrOut - usd * (mid - MONEY_CHANGER_MARKDOWN);
+
+  const distributor = Keypair.fromSecret(process.env.DISTRIBUTOR_SECRET!);
+  const res = await submit(distributor, (b) =>
     b.addOperation(
-      Operation.payment({ destination: user.publicKey, asset: USDC(), amount: String(usd) }),
+      Operation.payment({ destination: user.publicKey, asset: cIDR(), amount: cidrOut.toFixed(7) }),
     ),
   );
-
-  const userKp = Keypair.fromSecret(user.secret);
-  try {
-    const { hash, quote } = await swapUsdcToCidr(userKp, usd);
-    await recordTx(waNumber, "deposit", `Added ${rupiah(quote.cidrOut)}`, quote.cidrOut, "in", txHash);
-    return {
-      credited: true,
-      usd,
-      cidr: quote.cidrOut,
-      rate: quote.rate,
-      savingsIdr: quote.savingsIdr,
-      hash,
-      balances: await walletBalances(user.publicKey),
-    };
-  } catch (e) {
-    // The card already cleared, so the money must not vanish: keep it as USDC and let
-    // the wallet offer a manual exchange.
-    await recordTx(waNumber, "deposit", `Added $${usd} (exchange pending)`, 0, "in", txHash);
-    return {
-      credited: true,
-      usd,
-      exchangeFailed: (e as Error).message,
-      balances: await walletBalances(user.publicKey),
-    };
-  }
+  await recordTx(waNumber, "deposit", `Added ${rupiah(cidrOut)}`, cidrOut, "in", txHash);
+  return {
+    credited: true,
+    usd,
+    cidr: cidrOut,
+    rate: cidrOut / usd,
+    savingsIdr,
+    hash: res.hash,
+    balances: await walletBalances(user.publicKey),
+  };
 }
 
 app.post("/deposit/create", requireAuth, async (c) => {
@@ -374,14 +373,11 @@ app.post("/deposit/create", requireAuth, async (c) => {
   const amount = Number(usd);
   if (!amount || amount <= 0) return c.json({ error: "amount required" }, 400);
 
-  // A quote needs a route on the DEX, and a large enough amount has none. Fall back to
-  // the reference rate so the tier limit — not a liquidity error — is what the user sees.
-  const quote = await quoteUsdcToCidr(amount).catch(() => null);
-  const idrValue = quote?.cidrOut ?? amount * (await usdIdrMid()).rate;
-
-  const limit = await checkDepositLimit(waNumber, idrValue);
+  // Card money is credited at the reference rate (see creditUsdAsRupiah), so the tier limit
+  // is measured against that — no DEX quote, no liquidity error before the user even pays.
+  const cidrOut = refCidr(amount, (await usdIdrMid()).rate);
+  const limit = await checkDepositLimit(waNumber, cidrOut);
   if (!limit.ok) return c.json({ error: limit.error }, 403);
-  if (!quote) return c.json({ error: "that amount is too large to exchange right now" }, 400);
 
   // Save the card to a reusable customer so later top-ups need no card entry (see /deposit/charge).
   const customer = await stripeCustomerFor(user);
@@ -397,7 +393,7 @@ app.post("/deposit/create", requireAuth, async (c) => {
           unit_amount: Math.round(amount * 100),
           product_data: {
             name: "Castel top-up",
-            description: `Adds about ${rupiah(quote.cidrOut)} to your Castel balance`,
+            description: `Adds about ${rupiah(cidrOut)} to your Castel balance`,
           },
         },
       },
@@ -424,11 +420,9 @@ app.post("/deposit/charge", requireAuth, async (c) => {
   const card = await savedCard(user.stripeCustomerId);
   if (!card) return c.json({ error: "no saved card" }, 409);
 
-  const quote = await quoteUsdcToCidr(amount).catch(() => null);
-  const idrValue = quote?.cidrOut ?? amount * (await usdIdrMid()).rate;
-  const limit = await checkDepositLimit(waNumber, idrValue);
+  const cidrOut = refCidr(amount, (await usdIdrMid()).rate);
+  const limit = await checkDepositLimit(waNumber, cidrOut);
   if (!limit.ok) return c.json({ error: limit.error }, 403);
-  if (!quote) return c.json({ error: "that amount is too large to exchange right now" }, 400);
 
   let intent: Stripe.PaymentIntent;
   try {
