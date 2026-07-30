@@ -1,6 +1,6 @@
 import { Keypair, Operation } from "@stellar/stellar-sdk";
 import { timingSafeEqual } from "node:crypto";
-import { desc, eq } from "drizzle-orm";
+import { and, desc, eq, ne, or } from "drizzle-orm";
 import { type Context, Hono } from "hono";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
@@ -928,12 +928,19 @@ app.post("/cashout/redeem", async (c) => {
 });
 
 app.get("/me/history", requireAuth, async (c) => {
+  // Hide zero-amount deposit rows: these are internal idempotency markers (e.g. the quick-pay
+  // "Card charge" leg), not something a user should see as a "+Rp 0" line.
   const rows = await db
     .select()
     .from(transactions)
-    .where(eq(transactions.waNumber, c.get("wa")))
+    .where(
+      and(
+        eq(transactions.waNumber, c.get("wa")),
+        or(ne(transactions.type, "deposit"), ne(transactions.amountIdr, 0)),
+      ),
+    )
     .orderBy(desc(transactions.createdAt))
-    .limit(15);
+    .limit(25);
   return c.json(rows);
 });
 
