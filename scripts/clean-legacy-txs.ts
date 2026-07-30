@@ -7,15 +7,21 @@
  *   bun run scripts/clean-legacy-txs.ts --dry   # list what would go
  *   bun run scripts/clean-legacy-txs.ts         # delete
  */
-import { like, or } from "drizzle-orm";
+import { and, eq, like, or } from "drizzle-orm";
 import { db } from "../src/db";
 import { transactions } from "../src/db/schema";
 
 const DRY = process.argv.includes("--dry");
 
 const junk = or(
+  // Old "Deposited $N (card)" format with a wrong rupiah amount.
   like(transactions.title, "Deposited %"),
+  // "... (exchange pending)" markers from card top-ups that couldn't auto-convert.
   like(transactions.title, "%(exchange pending)%"),
+  // Legacy quick-pay rows recorded before the fix: type 'pay' with the session key
+  // ("<sessionId>:pay") in the hash column instead of the real Stellar tx hash, so they
+  // never linked on-chain. (New quick-pay rows are type 'quickpay' with the real hash.)
+  and(eq(transactions.type, "pay"), like(transactions.hash, "%:pay")),
 );
 
 async function main() {
