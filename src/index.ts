@@ -1,6 +1,6 @@
 import { Keypair, Operation } from "@stellar/stellar-sdk";
 import { timingSafeEqual } from "node:crypto";
-import { and, desc, eq, ne, or } from "drizzle-orm";
+import { and, desc, eq, ne } from "drizzle-orm";
 import { type Context, Hono } from "hono";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
@@ -744,7 +744,10 @@ app.post("/pay/quick/confirm", requireAuth, async (c) => {
       }),
     ),
   );
-  await recordTx(waNumber, "pay", info.merchantName, amountIdr, "out", payHash);
+  // The visible row carries the real Stellar hash so it links on-chain; a hidden zero-amount
+  // marker keyed on the session guards against paying the merchant twice on a retry.
+  await recordTx(waNumber, "quickpay", info.merchantName, amountIdr, "out", res.hash);
+  await recordTx(waNumber, "quickpay", info.merchantName, 0, "out", payHash);
 
   let settlement: Settlement | { error: string } | null = null;
   if (xenditEnabled()) {
@@ -927,17 +930,12 @@ app.post("/cashout/redeem", async (c) => {
 });
 
 app.get("/me/history", requireAuth, async (c) => {
-  // Hide zero-amount deposit rows: these are internal idempotency markers (e.g. the quick-pay
-  // "Card charge" leg), not something a user should see as a "+Rp 0" line.
+  // Hide zero-amount rows: these are internal idempotency markers (the quick-pay "Card charge"
+  // and merchant-payment guards), never something a user should see as a "Rp 0" line.
   const rows = await db
     .select()
     .from(transactions)
-    .where(
-      and(
-        eq(transactions.waNumber, c.get("wa")),
-        or(ne(transactions.type, "deposit"), ne(transactions.amountIdr, 0)),
-      ),
-    )
+    .where(and(eq(transactions.waNumber, c.get("wa")), ne(transactions.amountIdr, 0)))
     .orderBy(desc(transactions.createdAt))
     .limit(25);
   return c.json(rows);
