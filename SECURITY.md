@@ -72,6 +72,8 @@ Verified against the running service:
 | Exceed the Tier 0 limit | `403` |
 | Claim another user's on-chain XLM deposit by its tx hash | `403` — the payment must carry the depositor's MEMO_ID |
 | Double-credit a deposit by racing or retrying the convert | blocked — the idempotency hash is reserved before any cIDR is minted |
+| Pay a merchant or charge a card twice by retrying a request | blocked — a per-request idempotency key short-circuits the retry |
+| Exceed the 30-day cap by opening many Checkout sessions at once | `403` — in-flight sessions hold limit headroom until they expire or confirm |
 | Hammer auth or payment endpoints | `429` |
 
 ## Known gaps (honest list)
@@ -96,45 +98,36 @@ These are real, and we know exactly what each fix is.
    Fix: move to Postgres or Redis.
 6. **No `stellar.toml` (SEP-1)** — required before any anchor integration.
 
-### Concurrency, idempotency & settlement (found in an adversarial review, partly hardened)
+### Concurrency, idempotency & settlement (found in an adversarial review, hardened)
 
-A parallel code review of the deposit/pay rails found and fixed the two that could lose
-money — **claiming another user's XLM deposit** (now bound by a per-user `MEMO_ID`) and
-**concurrent double-crediting/double-paying** (every mint rail now reserves its idempotency
-hash *before* the on-chain submit, and the Circle rail sweeps its USDC reserve before issuing
-cIDR). These remain, with the fix understood for each:
+A parallel code review of the deposit/pay rails found the money-losing bugs, all now fixed:
 
-7. **Deposit/spend limits are checked at `create`, not at credit.** Deposits are only
-   recorded at confirm, so N Checkout sessions opened in parallel (each under the cap) can be
-   confirmed past the 30-day aggregation cap. The crypto rails (`/deposit/circle|xlm/convert`)
-   already re-check at convert; only the card `create → confirm` window is exposed. Refusing
-   *after* the card is charged would strand paid funds, so the fix is a short-lived
-   pending-reservation row at create — a compliance-cap bypass, not a loss to Castel.
-8. **`/deposit/charge` (saved-card one-tap) can double-charge on a failed credit.** The
-   PaymentIntent is captured before any durable record; if the mint then fails, a retry opens
-   a *new* charge and orphans the first. Fix: persist the paid `intent.id` before minting and
-   resume that intent on retry. (The Checkout `create → confirm` path already self-heals via
-   its stable session id.)
-9. **`/pay` (pay-from-balance) has no idempotency key.** A retry or double-tap can pay the
-   merchant twice, up to the balance. PIN-gated and user-initiated, so low likelihood — but it
-   is the one spend path still without a replay guard (quick-pay and the deposit rails now
-   reserve before submitting). Fix: accept a client idempotency key and gate the submit on it.
-10. **Merchant settlement is not retried.** If the Xendit disbursement fails (returned
-    non-fatally) after the on-chain payment, a later idempotent retry skips it — the user is
-    debited but the rupiah settlement is lost. Fix: persist settlement state and reconcile
-    out-of-band.
-11. **Quick-pay can under-fund on a large rate move.** The USD charge is sized at Checkout
-    time with a 3% buffer; if USD/IDR moves more than that before confirm (a tab left open
-    over an hour), the credited cIDR can fall below the bill and wedge the session. Fix: lock
-    the create-time rate into the session and credit at it.
-12. **The concurrency guards assume a single instance.** The per-account lock and the
-    reserve-before-submit that prevent double-mint are correct on one Render instance;
-    horizontal scale-out needs a database advisory lock — the same caveat as the in-memory
-    rate limiter (#5).
-13. **Fallback exchange rates are wide and never expire.** With the price feeds down,
-    `usdIdrMid`/`xlmUsd` serve the last cached (or a hardcoded fallback) rate with no
-    max-staleness bound, so a deposit could be mispriced during an outage. Not
-    attacker-controllable. Fix: bound the cache age and refuse to credit on a stale rate.
+- **Claiming another user's XLM deposit** — the payment is now bound by a per-user `MEMO_ID`
+  that convert verifies (`403` otherwise).
+- **Concurrent double-crediting / double-paying** — every mint rail reserves its idempotency
+  hash *before* the on-chain submit, and the Circle rail sweeps its USDC reserve before
+  issuing cIDR.
+- **Limit-window bypass via parallel sessions (#7)** — creating a Checkout session writes a
+  short-lived **hold** row (serialized per user), so the tier cap counts in-flight sessions and
+  a user can't collectively exceed it; the hold is released at confirm and expires after 1h.
+  No post-payment refusal, so no stranded funds.
+- **`/deposit/charge` double-charge (#8)** — the client sends a stable idempotency key that is
+  passed to Stripe, so a retry reuses the same `PaymentIntent` instead of charging again.
+- **`/pay` replay (#9)** — accepts a client idempotency key and reserves it before submitting,
+  so a retry / double-tap short-circuits to `alreadyPaid`.
+- **Dropped settlement (#10)** — the merchant is settled with a deterministic per-payment
+  `external_id`, and the `alreadyPaid` retry path re-attempts it; Xendit dedups, so it never
+  double-disburses.
+- **Quick-pay rate drift (#11)** — the create-time USD/IDR rate is locked into the session and
+  credited at, so a move before confirm can't under-fund the bill.
+- **Stale fallback rates (#13)** — `xlmUsd` drops to the conservative fallback once its cached
+  rate is over 6h old rather than pricing a deposit on a stale number.
+
+Residual (understood, not yet built):
+
+7. **The concurrency guards assume a single instance.** The per-account lock, the
+   reserve-before-submit, and the in-memory rate limiter (#5) are correct on one Render
+   instance; horizontal scale-out needs a database advisory lock.
 
 ## Roadmap out of custody
 
