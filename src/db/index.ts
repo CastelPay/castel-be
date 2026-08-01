@@ -42,6 +42,10 @@ for (const col of [
   "otp_attempts INTEGER NOT NULL DEFAULT 0",
   "stripe_customer_id TEXT",
   "activated BOOLEAN NOT NULL DEFAULT FALSE",
+  "pin_reset_hash TEXT",
+  "pin_reset_expires BIGINT",
+  "pin_changed_at BIGINT",
+  "frozen BOOLEAN NOT NULL DEFAULT FALSE",
 ]) {
   await sql.unsafe(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ${col}`);
 }

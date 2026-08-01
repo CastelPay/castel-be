@@ -7,10 +7,11 @@ if (!SECRET) throw new Error("SESSION_SECRET is required (32+ random chars)");
 export const LINK_TTL_MS = 15 * 60_000;
 export const SESSION_TTL_MS = 24 * 60 * 60_000;
 export const OTP_TTL_MS = 5 * 60_000;
+export const PIN_RESET_TTL_MS = 15 * 60_000;
 export const MAX_OTP_ATTEMPTS = 5;
 export const MAX_PIN_ATTEMPTS = 5;
 
-type Kind = "link" | "session";
+type Kind = "link" | "session" | "pinreset";
 type Claims = { wa: string; exp: number; kind: Kind };
 
 const hmac = (body: string) => createHmac("sha256", SECRET).update(body).digest("base64url");
@@ -59,9 +60,25 @@ export const verifySecret = (s: string, hash: string) => Bun.password.verify(s, 
 const lastSent = new Map<string, number>();
 const RESEND_COOLDOWN_MS = 30_000;
 
-export function throttleOtp(wa: string): boolean {
-  const prev = lastSent.get(wa) ?? 0;
-  if (Date.now() - prev < RESEND_COOLDOWN_MS) return false;
-  lastSent.set(wa, Date.now());
+export function throttleSend(key: string, cooldownMs = RESEND_COOLDOWN_MS): boolean {
+  const prev = lastSent.get(key) ?? 0;
+  if (Date.now() - prev < cooldownMs) return false;
+  lastSent.set(key, Date.now());
   return true;
+}
+
+export const throttleOtp = (wa: string) => throttleSend("otp:" + wa);
+
+/**
+ * The PIN is the one credential a WhatsApp takeover doesn't hand over, so it must not be the
+ * first thing an attacker would try. Rejects the guesses that dominate every leaked PIN set:
+ * one repeated digit and straight runs.
+ */
+export function pinProblem(pin: string): string | null {
+  if (!/^\d{6}$/.test(pin)) return "pin must be 6 digits";
+  if (/^(\d)\1{5}$/.test(pin)) return "too easy to guess — don't repeat one digit";
+  const run = (step: number) =>
+    pin.split("").every((d, i, all) => i === 0 || Number(d) === Number(all[i - 1]) + step);
+  if (run(1) || run(-1)) return "too easy to guess — don't use digits in a row";
+  return null;
 }

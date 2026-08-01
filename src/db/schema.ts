@@ -14,6 +14,15 @@ export const users = pgTable("users", {
   otpHash: text("otp_hash"),
   otpExpires: bigint("otp_expires", { mode: "number" }),
   otpAttempts: integer("otp_attempts").notNull().default(0),
+  // A forgotten PIN is recovered through a single-use link sent over WhatsApp. Storing the
+  // hash (not the token) is what makes it single-use: redeeming clears it, so a replayed
+  // link — from a forwarded chat or a shoulder-surfed screen — no longer matches anything.
+  pinResetHash: text("pin_reset_hash"),
+  pinResetExpires: bigint("pin_reset_expires", { mode: "number" }),
+  pinChangedAt: bigint("pin_changed_at", { mode: "number" }),
+  // Set by the owner replying BLOCK to the "your PIN was changed" alert: the escape hatch
+  // when the reset was someone else's doing.
+  frozen: boolean("frozen").notNull().default(false),
   stripeCustomerId: text("stripe_customer_id"),
 });
 

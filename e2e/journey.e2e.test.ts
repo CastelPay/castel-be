@@ -82,12 +82,17 @@ describe("full tourist journey", () => {
       expect(((await noPin.json()) as any).error).toBe("pin not set");
 
       expect((await call("/me/pin", { pin: "12345" }, token)).status).toBe(400);
+      // Guessable PINs are refused: a repeated digit and a straight run.
+      expect((await call("/me/pin", { pin: "999999" }, token)).status).toBe(400);
+      expect((await call("/me/pin", { pin: "123456" }, token)).status).toBe(400);
       expect((await call("/me/pin", { pin: PIN }, token)).status).toBe(200);
-      expect((await call("/me/pin", { pin: "999999" }, token)).status).toBe(409);
+      // A live session can't swap the PIN — that only happens through the WhatsApp reset link.
+      expect((await call("/me/pin", { pin: "846135" }, token)).status).toBe(409);
 
-      const wrongPin = await call("/pay", { payload: SAMPLE_QR, pin: "000000" }, token);
+      const wrongPin = await call("/pay", { payload: SAMPLE_QR, pin: "471902" }, token);
       expect(wrongPin.status).toBe(403);
-      expect(((await wrongPin.json()) as any).error).toBe("wrong pin");
+      // The message counts down, so the lock never arrives unannounced.
+      expect(((await wrongPin.json()) as any).error).toMatch(/wrong pin — 4 tries left/);
 
       const pay = await json(call("/pay", { payload: SAMPLE_QR, pin: PIN }, token));
       expect(pay.merchant).toBe("Warung Made Bali");

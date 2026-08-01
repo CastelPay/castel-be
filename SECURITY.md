@@ -26,7 +26,8 @@ enumerable. Authority now comes only from something the server issued:
 | Session | HMAC-SHA256 signed token (`SESSION_SECRET`), 24 h, `Authorization: Bearer` |
 | Proof of number | 6-digit OTP delivered **over WhatsApp**, single-use, 5 min, 5 attempts |
 | Magic link | Separately-typed signed token, 15 min — a link token cannot be used as a session token |
-| Spending | 6-digit PIN, argon2 (`Bun.password`), locks after 5 failures |
+| Spending | 6-digit PIN, argon2 (`Bun.password`), set during onboarding, locks after 5 failures |
+| Forgotten PIN | Single-use link over WhatsApp, 15 min — redeeming it clears the stored hash |
 | Webhook | Twilio `X-Twilio-Signature` verified against `PUBLIC_URL` |
 
 No route reads a caller-supplied `waNumber`. Identity is derived from the token.
@@ -40,6 +41,28 @@ gets a **legitimate** OTP and a **valid** session. Every layer above fails.
 The PIN is the one control that survives that: it is never typed into a chat, never sent
 over WhatsApp, and only ever entered on the web. Possession of the chat is not possession
 of the money.
+
+It is created during onboarding, in the same sitting as the OTP — before a wallet exists to
+fund. A wallet that can receive money before it can defend it is the wrong order, and a
+"set your PIN later" banner is a banner most people dismiss.
+
+**And the honest part: forgetting it has to be recoverable, and recovery runs over WhatsApp.**
+Without a reset, five wrong guesses would strand the balance permanently — a real user's most
+likely loss is their own memory, not an attacker. So `forgot pin` mails a reset link to the
+number. That does hand a WhatsApp takeover a path to the PIN, and we do not pretend otherwise.
+What it costs the attacker:
+
+- The link is **single-use** (its hash is stored and cleared on redemption) and dies in 15 min,
+  so a forwarded or shoulder-surfed link is usually already spent.
+- A successful reset **messages the number**: *"Your PIN was just changed."* The takeover stops
+  being silent, which is the property that actually matters — the victim is in the same chat.
+- That message carries a one-word kill switch: replying **BLOCK** freezes spending immediately,
+  before the attacker can move funds. `checkPin` refuses everything on a frozen account.
+- Both the reset request and `/me/pin/*` are rate-limited, and a session token alone can never
+  change an existing PIN (`/me/pin` returns `409`) — only the WhatsApp link can.
+
+The residual risk is a takeover that resets, spends, and finishes before the owner reads one
+WhatsApp message. Closing that needs a second channel that isn't WhatsApp (see gap 7).
 
 ## Tier 0 limits are compliance, in code
 
@@ -68,6 +91,10 @@ Verified against the running service:
 | Reuse an OTP | rejected |
 | POST to `/wa/webhook` impersonating a number | `403` |
 | Spend with a hijacked WhatsApp session | blocked at the PIN |
+| Change the PIN with a stolen session token | `409` — only the WhatsApp reset link can |
+| Reuse a PIN reset link | `401` — the stored hash is cleared on first redemption |
+| Redeem a magic link as a PIN reset (or vice versa) | `401` — the token kind is signed in |
+| Brute-force a PIN | locks after 5 tries; the counter increments in SQL, so racing doesn't inflate it |
 | Redeem a cash-out escrow without the pickup code | `403` |
 | Exceed the Tier 0 limit | `403` |
 | Claim another user's on-chain XLM deposit by its tx hash | `403` — the payment must carry the depositor's MEMO_ID |
@@ -97,6 +124,12 @@ These are real, and we know exactly what each fix is.
 5. **In-memory rate limiting** breaks the moment we run more than one instance.
    Fix: move to Postgres or Redis.
 6. **No `stellar.toml` (SEP-1)** — required before any anchor integration.
+7. **PIN recovery has no second channel.** `forgot pin` is delivered over the same WhatsApp
+   account the PIN is meant to survive the loss of, so a takeover can reset it. Today that is
+   bounded by a single-use 15-minute link, a change alert, and the `BLOCK` freeze (above), which
+   makes the attack loud rather than impossible. Fix: bind the reset to something WhatsApp
+   doesn't grant — a passkey on the enrolled device, or an email/Telegram second factor
+   captured at onboarding.
 
 ### Concurrency, idempotency & settlement (found in an adversarial review, hardened)
 
