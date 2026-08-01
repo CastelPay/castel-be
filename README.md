@@ -59,15 +59,20 @@ et al., ASEAN Journal on Hospitality and Tourism 13(1), 2014 — accommodation s
 ## How it works
 
 ```
-  WhatsApp                        Web (camera + card only)            Stellar
- ──────────                      ─────────────────────────          ───────────
+  WhatsApp                        Web (camera · card · wallet)         Stellar
+ ──────────                      ──────────────────────────────      ───────────
 
   "topup"  ─── magic link ──▶   Stripe Checkout (USD)
-                                        │
-                                 card charged in USD                USDC ─┐
-                                        │                                 │ path
-                                        ▼                                 │ payment
-                                balance in RUPIAH  ◀───────────────────  cIDR
+                                        │  card charged in USD,
+                                        │  credited at the reference
+                                        ▼  rate (30 bps spread)
+                                balance in RUPIAH (cIDR)          reserve held at Stripe
+
+                                connect wallet (Freighter)
+                                        │  send USDC or native XLM;
+                                        │  treasury takes it as reserve,
+                                        ▼  cIDR issued at reference rate
+                                balance in RUPIAH (cIDR)  ◀──  USDC / XLM ──▶ treasury
 
   "pay"    ─── magic link ──▶   scan QRIS → PIN → paid
                                         │                           cIDR ──▶ treasury
@@ -86,8 +91,11 @@ et al., ASEAN Journal on Hospitality and Tourism 13(1), 2014 — accommodation s
 owns and keeps. The web pages exist only for the two things a chat cannot do: **use a
 camera**, and **take a card number**. They report back to the chat.
 
-The tourist never sees the word "crypto". They deposit dollars and their balance reads in
-rupiah, because the USDC→cIDR conversion happens the moment the card clears.
+The tourist never sees the word "crypto". They tap a card and their balance reads in
+rupiah, because the card is credited as rupiah (cIDR) directly at the live reference rate
+the moment it clears — no dollar balance to convert, nothing to strand. A crypto-native
+user can instead connect a Stellar wallet and fund from real USDC or native XLM; the
+treasury takes the crypto as reserve and issues the same rupiah balance.
 
 ---
 
@@ -98,8 +106,9 @@ Nothing in the core flow is mocked.
 | | |
 |---|---|
 | **QRIS** | Real EMVCo TLV parser — decodes live merchant QR codes |
-| **Card on-ramp** | **Stripe** Checkout, test mode — a real card, charged in USD |
-| **FX** | **Stellar path payment** across the protocol's built-in order book — a real on-chain swap, priced against the **live USD/IDR rate** |
+| **Card on-ramp** | **Stripe** Checkout, test mode — a real card, charged in USD; cIDR credited **directly at the live USD/IDR reference rate** (30 bps spread), no intermediate dollar balance |
+| **Crypto on-ramp** | **Stellar Wallets Kit** + **Freighter** — connect a wallet and deposit real **Circle testnet USDC** or **native XLM**; treasury takes it as reserve, cIDR issued at the reference rate (anchor-style) |
+| **DEX / path payment** | **Stellar path payment** across the protocol's built-in order book — a real on-chain swap, priced against the **live USD/IDR rate**; powers the optional "exchange held USDC → rupiah" path |
 | **Merchant settlement** | **Xendit** Disbursement API, sandbox — a real IDR payout call |
 | **Cash-out** | **Soroban escrow** on testnet — hashlock, refund timelock, fee split, on-chain release |
 | **WhatsApp** | **Twilio** WhatsApp sandbox — signature-verified webhook |
@@ -114,10 +123,17 @@ Testnet and sandbox keys throughout; no real money moves. cIDR has no fiat backi
 Not "we needed a blockchain". Each of these is a protocol primitive no other L1 has, and
 each one is load-bearing:
 
-- **Path payments** — `USDC → cIDR` is a *single atomic operation* routed through Stellar's
-  built-in DEX, with a slippage bound derived from a live quote. No AMM to deploy, no router
-  contract, no approval step. On an EVM chain this is a Uniswap deployment plus a seeded
-  pool; here it is one operation.
+- **Path payments** — the optional "exchange held USDC → cIDR" path is a *single atomic
+  operation* routed through Stellar's built-in DEX, with a slippage bound derived from a live
+  quote. No AMM to deploy, no router contract, no approval step. On an EVM chain this is a
+  Uniswap deployment plus a seeded pool; here it is one operation. (The primary card and
+  quick-pay rails skip the DEX entirely — they credit rupiah directly at the reference rate.)
+- **Real wallet interop, native assets as first-class deposits** — a crypto-native user
+  connects **Freighter** through the Stellar Wallets Kit and deposits real **Circle testnet
+  USDC** or **native XLM** straight from their own wallet. The treasury takes the incoming
+  crypto as reserve and issues cIDR at the live reference rate — an anchor-style on-ramp with
+  no DEX hop. Accepting native XLM as a first-class deposit asset, verified by its on-chain
+  tx hash, is a Stellar primitive no card network gives you.
 - **Native asset issuance + trustlines** — cIDR is not a token contract. It is a classic
   Stellar asset, so it gets the order book, path payments and anchor compatibility for free.
   Writing a SEP-41 token contract instead would have *removed* all three.
@@ -203,11 +219,16 @@ bun run scripts/seed-liquidity.ts   # two-sided USDC/cIDR market on the DEX
 bun run scripts/refresh-market.ts   # re-price the book against the live USD/IDR mid
 ```
 
-Stellar has **no peg mechanism** — a swap executes at whatever the order book says. The rate
-only tracks reality because a market maker keeps re-posting: that is `refresh-market.ts`, and
-it is the off-chain half of an anchor. Run it on a schedule. (An *on-chain* oracle would only
-be needed if a **contract** had to read the price; path payments read the order book, so the
-price feed belongs off-chain.)
+The last two scripts power the **optional USDC-exchange path only** — the DEX book that a
+user with held USDC swaps across. The primary card, quick-pay, native-XLM and Circle-USDC
+rails do not touch the DEX; they credit rupiah directly at the reference rate, so they need
+no seeded liquidity.
+
+On that USDC-exchange path, Stellar has **no peg mechanism** — a swap executes at whatever
+the order book says. The rate only tracks reality because a market maker keeps re-posting:
+that is `refresh-market.ts`, and it is the off-chain half of an anchor. Run it on a schedule.
+(An *on-chain* oracle would only be needed if a **contract** had to read the price; path
+payments read the order book, so the price feed belongs off-chain.)
 
 Tests:
 

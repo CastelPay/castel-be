@@ -55,11 +55,46 @@ Checklist uji end-to-end setelah rombakan auth (tahap 1–5) dan redesign rupiah
 | 🔲 3.1 | Tap **"+ Add money"** → isi `100` | Preview: **"You get Rp 1.6xx.xxx"** + **"vs money changer +Rp xx.xxx"** |
 | 🔲 3.2 | *Top up with card →* → kartu **4242 4242 4242 4242**, exp `12/34`, CVC `123` | Redirect kembali ke wallet |
 | 🔲 3.3 | Lihat saldo | 🎯 Saldo dalam **RUPIAH**. Toast: *"Rp 1.6xx.xxx added — Rp xx.xxx more than a money changer"* |
-| 🔲 3.4 | Cek tidak ada USDC nyangkut | 🎯 Tidak ada baris *"USDC waiting to be exchanged"*. Tidak ada seksi *"Exchange to rupiah"* |
+| 🔲 3.4 | Cek tidak ada USDC nyangkut | 🎯 Tidak ada baris *"USDC waiting to be exchanged"*. Tidak ada seksi *"Exchange to rupiah"* — kartu dikreditkan **langsung sebagai rupiah**, tidak ada saldo dolar yang bisa nyangkut |
 | 🔲 3.5 | Cek riwayat | `+Rp 1.6xx.xxx` (bukan `+$100`), ada link **"View on-chain ↗"** |
-| 🔲 3.6 | Tap link on-chain | Stellar Explorer menampilkan path payment sungguhan |
+| 🔲 3.6 | Tap link on-chain | Stellar Explorer menampilkan **penerbitan cIDR sungguhan** ke akun kamu (bukan path payment — kartu tidak lewat DEX) |
 
-> Kalau **3.4 gagal** (USDC nyangkut), auto-swap bermasalah — laporkan.
+> Kalau **3.3 gagal** (rupiah tidak masuk), kredit langsung (`creditUsdAsRupiah`) bermasalah — laporkan. Tidak ada lagi tahap auto-swap USDC→cIDR di jalur kartu, jadi tidak ada yang bisa nyangkut di sini.
+
+---
+
+## 3B. On-ramp kripto — connect wallet (Freighter) — 🔲 manual
+
+> 🎯 Jalur untuk pengguna crypto-native: deposit **USDC Circle** atau **XLM native** langsung dari wallet sendiri. Treasury menerima kripto sebagai cadangan lalu menerbitkan cIDR di reference rate (gaya anchor) — **tanpa DEX**. Saldo tetap tampil **rupiah**; tourist biasa tidak perlu jalur ini.
+
+### Pra-flight wallet
+
+| # | Langkah | Harapan |
+|---|---|---|
+| 🔲 3B.0a | Pasang ekstensi **Freighter** → buka → **switch ke Testnet** | Freighter aktif di jaringan **Test SDF Network ; September 2015** |
+| 🔲 3B.0b | Danai akun via **Friendbot** (`friendbot.stellar.org` atau tombol *Fund with Friendbot* di Freighter) | Akun punya saldo **XLM testnet** (mis. 10.000 XLM) |
+
+### Deposit XLM native
+
+| # | Langkah | Harapan |
+|---|---|---|
+| 🔲 3B.1 | Wallet → **+ Add money** → tab **Crypto** → *Connect wallet* → pilih **Freighter** | Freighter minta approve koneksi; alamat wallet muncul di sheet |
+| 🔲 3B.2 | Asset picker → pilih **XLM** → isi jumlah → *Send from wallet* | Freighter minta tanda tangan pembayaran XLM **ke alamat treasury** |
+| 🔲 3B.3 | Approve di Freighter | Tx terkirim; sheet konfirmasi *"payment received"* (harga XLM→USD via Coinbase → IDR) |
+| 🔲 3B.4 | Lihat saldo | 🎯 Saldo **RUPIAH** naik. Tidak ada saldo XLM/USDC yang tampil ke user |
+| 🔲 3B.5 | Cek riwayat → tap **"View on-chain ↗"** | Stellar Explorer menampilkan pembayaran XLM sungguhan ke treasury; cIDR diterbitkan ke akun kamu |
+| 🔲 3B.6 | Ulangi `/deposit/xlm/convert` dengan **tx hash yang sama** | 🎯 Idempoten — tidak dobel-kredit |
+
+### Deposit USDC (Circle testnet)
+
+| # | Langkah | Harapan |
+|---|---|---|
+| 🔲 3B.7 | Ambil USDC testnet dari **`faucet.circle.com`** (jaringan Stellar Testnet) ke alamat Freighter kamu | Saldo USDC Circle (issuer `GBBD47IF…FLA5`) masuk ke wallet |
+| 🔲 3B.8 | Tab **Crypto** → pilih **USDC** → *Prepare* | `/deposit/circle/prepare` menambahkan **trustline** cIDR/USDC di alamat Castel kamu |
+| 🔲 3B.9 | Kirim USDC dari Freighter ke alamat Castel → *Convert* | `/deposit/circle/convert` mengkredit **cIDR di reference rate**; saldo rupiah naik |
+| 🔲 3B.10 | Cek riwayat → link on-chain | Transfer USDC sungguhan + penerbitan cIDR; **tidak lewat DEX** |
+
+> Ini **bukan** jalur `/fx/swap`. Swap DEX (path payment) hanya dipakai untuk menukar **USDC yang sudah dipegang** menjadi rupiah — lihat catatan arsitektur. Deposit XLM/USDC di atas menerbitkan cIDR langsung.
 
 ---
 
@@ -74,11 +109,13 @@ Checklist uji end-to-end setelah rombakan auth (tahap 1–5) dan redesign rupiah
 | 🔲 4.5 | Lihat struk | Baris **"Merchant settlement"** → `PENDING` · Xendit · BCA + ID disbursement |
 | 🔲 4.6 | Kembali ke wallet | Bar plafon naik: *"Rp 85.000 of Rp 16.500.000 spent"* |
 
-### Jalur cadangan (ide "scan → pay")
+### Jalur cadangan — Quick Pay (scan → bayar tanpa saldo)
 
 | # | Langkah | Harapan |
 |---|---|---|
-| 🔲 4.7 | Pay QRIS saat saldo **kurang** | 🎯 Muncul *"Not enough balance"* + tombol **"Top up with card →"** |
+| 🔲 4.7 | Pay QRIS saat saldo **kurang** | 🎯 Muncul *"Not enough balance"* + tombol **"Top up with card →"** (Quick Pay) |
+| 🔲 4.8 | Lanjut Quick Pay: bayar tagihan dengan kartu (`4242…`) | Stripe menagih **persis sebesar tagihan**; cIDR diterbitkan **langsung di reference rate** (tanpa DEX) via `/pay/quick/create` → `/pay/quick/confirm` |
+| 🔲 4.9 | Cek riwayat | Baris ber-tag **"Quick Pay"** dengan **tx hash Stellar** sungguhan; merchant tetap dibayar rupiah lewat Xendit |
 
 ---
 
@@ -128,13 +165,14 @@ Checklist uji end-to-end setelah rombakan auth (tahap 1–5) dan redesign rupiah
 | | Jumlah | Status |
 |---|---|---|
 | Otomatis (security + plafon) | 13 | ✅ lulus di produksi |
-| Manual (browser / kartu / WhatsApp) | 25 | 🔲 menunggu |
+| Manual (browser / kartu / WhatsApp / wallet) | 39 | 🔲 menunggu |
 
-**Prioritaskan bagian 3.** Selebihnya sudah pernah berjalan sebelum rombakan.
+**Prioritaskan bagian 3** (kredit rupiah langsung dari kartu) **dan 3B** (on-ramp kripto lewat Freighter) — keduanya inti arsitektur saat ini. Selebihnya sudah pernah berjalan sebelum rombakan.
 
 ## Catatan cepat untuk hari-H
 
 - Panaskan backend sebelum tampil (bagian 0.1).
 - Penguji/juri harus `join` sandbox WhatsApp lebih dulu (bagian 0.2).
 - Kartu uji: `4242 4242 4242 4242` · exp apa saja di masa depan · CVC apa saja.
+- Untuk demo on-ramp kripto (3B): pasang **Freighter**, **switch ke Testnet**, danai via **Friendbot** dulu; USDC testnet dari `faucet.circle.com`.
 - Xendit sandbox mengembalikan `PENDING` — itu memang benar. Settlement bersifat asinkron; sebutkan sebagai *"settlement initiated"*, jangan diklaim selesai.

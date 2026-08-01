@@ -18,23 +18,26 @@ flowchart LR
     Agent(["🏪 Money changer"])
 
     WA["💬 WhatsApp<br/>identity + concierge"]
-    FE["🖥️ castel-fe<br/>web wallet · camera · card"]
+    FE["🖥️ castel-fe<br/>web wallet · camera · card · connect"]
     BE["⚙️ castel-be<br/>API · custody · FX"]
     SC["📜 castel-sc<br/>Soroban escrow"]
 
     Twilio["📨 Twilio"]
     Stripe["💳 Stripe<br/>card → USD"]
+    Wallet["🦊 Freighter<br/>USDC · native XLM"]
     Xendit["🏦 Xendit<br/>→ IDR"]
-    Stellar["⭐ Stellar<br/>DEX · path payment · cIDR"]
+    Stellar["⭐ Stellar<br/>cIDR · path payment · DEX"]
 
     Tourist -->|chats| WA
     WA <-->|magic link| Twilio
     Twilio <--> BE
     Tourist -->|scan · pay by card| FE
+    Tourist -->|connect wallet| Wallet
     FE <-->|signed session| BE
 
-    BE -->|charge| Stripe
-    BE -->|USDC → cIDR| Stellar
+    BE -->|charge card| Stripe
+    Wallet -->|USDC / XLM as reserve| BE
+    BE -->|issue cIDR at reference rate · optional USDC swap| Stellar
     BE -->|lock / release| SC --> Stellar
     BE -->|payout| Xendit -->|rupiah| Merchant
     Agent -->|hands cash| Tourist
@@ -42,13 +45,15 @@ flowchart LR
     classDef castel fill:#dbe4ff,stroke:#4263eb,color:#1a1a2e;
     classDef ext fill:#fff9db,stroke:#f59f00,color:#1a1a2e;
     class FE,BE,SC castel;
-    class Twilio,Stripe,Xendit,Stellar ext;
+    class Twilio,Stripe,Wallet,Xendit,Stellar ext;
 ```
 
-**The one-line read:** WhatsApp is the account, the web app is just a camera and a card
-form, the backend holds the keys and moves the money, Stellar is the FX rail, and the
-Soroban contract escrows the cash-out. Merchants and agents always touch **rupiah**, never
-crypto.
+**The one-line read:** WhatsApp is the account, the web app is a camera, a card form and a
+wallet-connect button, the backend holds the keys and moves the money, and Stellar carries
+the rupiah asset. A card top-up (or a connected wallet's USDC/XLM) is credited as rupiah
+**directly at the reference rate** — the DEX and path payment power only the optional
+"exchange held USDC → rupiah" path. The Soroban contract escrows the cash-out. Merchants and
+agents always touch **rupiah**, never crypto.
 
 ---
 
@@ -63,7 +68,7 @@ flowchart TB
     subgraph FE["🖥️ castel-fe · Next.js 16"]
         direction TB
         Psignin["SignIn — WhatsApp OTP"]
-        Pwallet["/wallet — balance · top-up · limits"]
+        Pwallet["/wallet — balance · top-up (card · crypto) · limits"]
         Ppay["/pay — camera QRIS scan"]
         Pcash["/cashout — pickup QR"]
         Pagent["/agent — release escrow"]
@@ -78,8 +83,10 @@ flowchart TB
             Lauth["lib/auth — HMAC token · OTP · PIN (argon2)"]
         end
         subgraph BMoney["money routes (requireAuth + PIN + Tier-0)"]
-            Rdep["/deposit/create · /confirm"]
-            Rswap["/fx/swap · /fx/quote"]
+            Rdep["/deposit/create · /confirm · /charge"]
+            Rcrypto["/deposit/circle/* · /deposit/xlm/convert"]
+            Rquick["/pay/quick/create · /confirm"]
+            Rswap["/fx/swap · /fx/quote · /deposit/usdc/convert"]
             Rpay["/pay"]
             Rcash["/cashout/request · /redeem"]
             Rme["/me/balance · /history · /limits"]
@@ -91,7 +98,8 @@ flowchart TB
             Lxen["lib/xendit — disbursement"]
             Lrates["lib/rates — live USD/IDR"]
             Llim["lib/limits — Tier 0 CDD"]
-            Sfx["services/fx — quote · path payment"]
+            Sdep["services/deposit — creditUsdAsRupiah<br/><i>direct cIDR at reference rate (no DEX)</i>"]
+            Sfx["services/fx — quoteUsdcToCidr · swapUsdcToCidr<br/><i>path payment · USDC-exchange path only</i>"]
             Scust["services/custody — createWallet"]
         end
         Rwa["/wa/webhook — signature-verified"]
@@ -105,16 +113,17 @@ flowchart TB
     subgraph Ext["External services"]
         Twilio["📨 Twilio WhatsApp"]
         Stripe["💳 Stripe Checkout"]
+        Freighter["🦊 Freighter / Wallets Kit"]
         Xendit["🏦 Xendit disbursement"]
-        FX["📈 exchangerate-api"]
+        FX["📈 exchangerate-api · Coinbase spot"]
     end
 
     subgraph Chain["⭐ Stellar testnet"]
         direction TB
         Issuer["Issuer — cIDR<br/><i>AUTH_REVOCABLE · clawback</i>"]
-        Treasury["Treasury — USDC float"]
-        Dist["Distributor — DEX market maker"]
-        UserW["User wallets (custodial)"]
+        Treasury["Treasury — reserve<br/><i>incoming USDC · XLM counterparty</i>"]
+        Dist["Distributor — DEX market maker<br/><i>USDC-exchange path only</i>"]
+        UserW["User wallets (custodial + connected)"]
         SAC["cIDR SAC (SEP-41 bridge)"]
         Horizon["Horizon (classic)"]
         SRPC["Soroban RPC"]
@@ -131,11 +140,18 @@ flowchart TB
     Rauth -.->|OTP| Twilio
 
     Rdep --> Stripe
-    Rdep --> Sfx
+    Rdep --> Sdep
+    Rquick --> Stripe
+    Rquick --> Sdep
+    Rcrypto --> Sdep
     Rswap --> Sfx
+    Sdep --> Lrates
     Sfx --> Lrates -.->|USD/IDR| FX
+    Sdep --> Lstellar
     Sfx --> Lstellar
     Scust --> Lstellar
+    Pwallet -.->|connect| Freighter
+    Freighter -->|USDC / native XLM| Treasury
     Rpay --> Lqris
     Rpay --> Lstellar
     Rpay --> Lxen --> Xendit
@@ -159,7 +175,7 @@ flowchart TB
 | Layer | Owns | Does **not** |
 |---|---|---|
 | **castel-fe** | Camera scan, card hand-off, PIN entry, showing rupiah | Hold keys, sign transactions, know a phone number is real |
-| **castel-be** | Custody (Stellar keys), auth, FX, QRIS decode, settlement, limits | Store card numbers (Stripe does), run the AMM (the DEX does) |
+| **castel-be** | Custody (Stellar keys), auth, direct cIDR issuance, USDC-exchange swap, QRIS decode, settlement, limits | Store card numbers (Stripe does), run the AMM (the DEX does) |
 | **castel-sc** | Trustless cash-out escrow (hashlock, timelock, fee split) | Anything in the deposit/pay path — that is all Stellar Classic |
 
 ### Why the split
@@ -168,5 +184,9 @@ flowchart TB
   never sees a secret. The phone number is identity, a signed token is authority.
 - **The card form and the camera are the only reasons the web app exists** — a chat can do
   neither. Everything else is a WhatsApp message.
-- **Soroban is used once.** Deposit and pay are Stellar Classic (path payments); only the
-  cash-out needs custom on-chain logic, so only the cash-out is a contract.
+- **Deposit credits rupiah directly.** A card top-up (and a connected wallet's USDC or
+  native XLM) is credited as cIDR straight to the user at the live reference rate — no DEX,
+  no intermediate dollar balance, nothing that can strand. The built-in DEX + path payment is
+  Stellar Classic too, but it now powers only the optional "exchange held USDC → rupiah" path.
+- **Soroban is used once.** Deposit and pay are Stellar Classic; only the cash-out needs
+  custom on-chain logic, so only the cash-out is a contract.
