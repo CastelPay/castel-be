@@ -65,7 +65,7 @@ app.use("/auth/*", async (c, next) => {
   await next();
 });
 
-for (const path of ["/pay", "/cashout/request", "/fx/swap", "/deposit/create", "/fund"]) {
+for (const path of ["/pay", "/pay/*", "/cashout/request", "/fx/swap", "/deposit/*", "/fund"]) {
   app.use(path, async (c, next) => {
     const who = c.req.header("Authorization") ?? clientIp(c);
     if (!rateLimit("money:" + who, 20, 60_000))

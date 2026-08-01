@@ -29,7 +29,9 @@ async function sumSince(waNumber: string, types: string[]): Promise<number> {
   return Number(row?.total ?? 0);
 }
 
-export const spentIdr = (waNumber: string) => sumSince(waNumber, ["pay", "cashout"]);
+// "quickpay" is a merchant payment funded by a card per-bill; it counts toward the spend
+// window exactly like "pay", or the 30-day aggregation cap could be bypassed via that rail.
+export const spentIdr = (waNumber: string) => sumSince(waNumber, ["pay", "cashout", "quickpay"]);
 export const depositedIdr = (waNumber: string) => sumSince(waNumber, ["deposit"]);
 
 const rupiah = (n: number) => `Rp ${Math.round(n).toLocaleString("id-ID")}`;
