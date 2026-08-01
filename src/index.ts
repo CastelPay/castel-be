@@ -162,6 +162,39 @@ const recordTx = (
     createdAt: Date.now(),
   });
 
+/**
+ * Reserve `hash` for exactly one credit by inserting its ledger row up front. The unique index
+ * on `hash` makes this atomic, so a concurrent or replayed request that would otherwise mint a
+ * second time gets `false` and must skip the on-chain submit. Call releaseHash if the submit
+ * then fails, so a genuine retry can re-attempt.
+ */
+async function reserveHash(
+  waNumber: string,
+  type: string,
+  title: string,
+  amountIdr: number,
+  direction: "in" | "out",
+  hash: string,
+): Promise<boolean> {
+  const inserted = await db
+    .insert(transactions)
+    .values({
+      waNumber,
+      type,
+      title,
+      amountIdr: Math.round(amountIdr),
+      direction,
+      hash,
+      createdAt: Date.now(),
+    })
+    .onConflictDoNothing()
+    .returning({ id: transactions.id });
+  return inserted.length > 0;
+}
+
+const releaseHash = (hash: string) =>
+  db.delete(transactions).where(eq(transactions.hash, hash)).catch(() => {});
+
 app.get("/", (c) => c.json({ ok: true, service: "castel-be" }));
 
 const normalizeWa = (s: string) => s.trim().replace(/[^\d+]/g, "");
@@ -339,29 +372,35 @@ async function savedCard(customerId: string): Promise<Stripe.PaymentMethod | nul
  */
 async function creditUsdAsRupiah(user: User, waNumber: string, usd: number, txHash: string) {
   await ensureActivated(user);
-  const already = (await db.select().from(transactions).where(eq(transactions.hash, txHash)))[0];
-  if (already) return { credited: false, usd, balances: await walletBalances(user.publicKey) };
 
   const mid = (await usdIdrMid()).rate;
   const cidrOut = refCidr(usd, mid);
   const savingsIdr = cidrOut - usd * (mid - MONEY_CHANGER_MARKDOWN);
 
-  const distributor = Keypair.fromSecret(process.env.DISTRIBUTOR_SECRET!);
-  const res = await submit(distributor, (b) =>
-    b.addOperation(
-      Operation.payment({ destination: user.publicKey, asset: cIDR(), amount: cidrOut.toFixed(7) }),
-    ),
-  );
-  await recordTx(waNumber, "deposit", `Added ${rupiah(cidrOut)}`, cidrOut, "in", txHash);
-  return {
-    credited: true,
-    usd,
-    cidr: cidrOut,
-    rate: cidrOut / usd,
-    savingsIdr,
-    hash: res.hash,
-    balances: await walletBalances(user.publicKey),
-  };
+  // Reserve the txHash before minting so a concurrent or replayed confirm can't double-credit.
+  if (!(await reserveHash(waNumber, "deposit", `Added ${rupiah(cidrOut)}`, cidrOut, "in", txHash)))
+    return { credited: false, usd, balances: await walletBalances(user.publicKey) };
+
+  try {
+    const distributor = Keypair.fromSecret(process.env.DISTRIBUTOR_SECRET!);
+    await submit(distributor, (b) =>
+      b.addOperation(
+        Operation.payment({ destination: user.publicKey, asset: cIDR(), amount: cidrOut.toFixed(7) }),
+      ),
+    );
+    return {
+      credited: true,
+      usd,
+      cidr: cidrOut,
+      rate: cidrOut / usd,
+      savingsIdr,
+      hash: txHash,
+      balances: await walletBalances(user.publicKey),
+    };
+  } catch (e) {
+    await releaseHash(txHash);
+    throw e;
+  }
 }
 
 app.post("/deposit/create", requireAuth, async (c) => {
@@ -610,14 +649,22 @@ app.post("/deposit/xlm/convert", requireAuth, async (c) => {
   const limit = await checkDepositLimit(waNumber, cidrOut);
   if (!limit.ok) return c.json({ error: limit.error }, 403);
 
+  // Reserve the tx hash before minting so a concurrent/replayed convert can't double-credit.
+  if (!(await reserveHash(waNumber, "deposit", `Added ${rupiah(cidrOut)} (XLM)`, cidrOut, "in", hash)))
+    return c.json({ error: "this deposit was already credited" }, 409);
+
   // The XLM is already in the treasury (the reserve); issue the matching cIDR to the user.
-  const distributor = Keypair.fromSecret(process.env.DISTRIBUTOR_SECRET!);
-  await submit(distributor, (b) =>
-    b.addOperation(
-      Operation.payment({ destination: user.publicKey, asset: cIDR(), amount: cidrOut.toFixed(7) }),
-    ),
-  );
-  await recordTx(waNumber, "deposit", `Added ${rupiah(cidrOut)} (XLM)`, cidrOut, "in", hash);
+  try {
+    const distributor = Keypair.fromSecret(process.env.DISTRIBUTOR_SECRET!);
+    await submit(distributor, (b) =>
+      b.addOperation(
+        Operation.payment({ destination: user.publicKey, asset: cIDR(), amount: cidrOut.toFixed(7) }),
+      ),
+    );
+  } catch (e) {
+    await releaseHash(hash);
+    throw e;
+  }
   return c.json({
     credited: true,
     xlm,
@@ -700,31 +747,29 @@ app.post("/pay/quick/confirm", requireAuth, async (c) => {
   const info = parseQris(payload);
   const userKp = Keypair.fromSecret(user.secret);
 
-  // The card-charge leg is marked before the swap so a repeated redirect can never charge
-  // the card twice, even if the swap or the merchant payment below throws and is retried.
-  const charged = (
-    await db.select().from(transactions).where(eq(transactions.hash, sessionId))
-  )[0];
-  if (!charged) {
-    // Direct-rupiah: the card money is the reserve, so issue cIDR straight to the user at the
-    // reference rate — no USDC minted, no DEX swap that a thin book could fail.
-    const cidrOut = refCidr(usd, (await usdIdrMid()).rate);
-    const distributor = Keypair.fromSecret(process.env.DISTRIBUTOR_SECRET!);
-    await submit(distributor, (b) =>
-      b.addOperation(
-        Operation.payment({ destination: user.publicKey, asset: cIDR(), amount: cidrOut.toFixed(7) }),
-      ),
-    );
-    await recordTx(waNumber, "deposit", `Card charge · ${info.merchantName}`, 0, "in", sessionId);
+  // The card-charge leg: reserve the session marker BEFORE minting so a concurrent redirect
+  // (two tabs / a retry) can't issue cIDR twice for one card charge.
+  if (await reserveHash(waNumber, "deposit", `Card charge · ${info.merchantName}`, 0, "in", sessionId)) {
+    try {
+      // Direct-rupiah: the card money is the reserve, so issue cIDR straight to the user at the
+      // reference rate — no USDC minted, no DEX swap that a thin book could fail.
+      const cidrOut = refCidr(usd, (await usdIdrMid()).rate);
+      const distributor = Keypair.fromSecret(process.env.DISTRIBUTOR_SECRET!);
+      await submit(distributor, (b) =>
+        b.addOperation(
+          Operation.payment({ destination: user.publicKey, asset: cIDR(), amount: cidrOut.toFixed(7) }),
+        ),
+      );
+    } catch (e) {
+      await releaseHash(sessionId);
+      throw e;
+    }
   }
 
-  // The merchant-payment leg has its own marker keyed on the same session, so a retry
-  // after the swap resumes into the payment instead of paying the merchant twice.
+  // The merchant-payment leg: reserve its own marker BEFORE submitting, so a concurrent or
+  // replayed confirm can't pay the merchant twice.
   const payHash = `${sessionId}:pay`;
-  const alreadyPaid = (
-    await db.select().from(transactions).where(eq(transactions.hash, payHash))
-  )[0];
-  if (alreadyPaid) {
+  if (!(await reserveHash(waNumber, "quickpay", info.merchantName, 0, "out", payHash))) {
     return c.json({
       merchant: info.merchantName,
       city: info.city,
@@ -735,19 +780,24 @@ app.post("/pay/quick/confirm", requireAuth, async (c) => {
     });
   }
 
-  const res = await submit(userKp, (b) =>
-    b.addOperation(
-      Operation.payment({
-        destination: process.env.TREASURY_PUBLIC!,
-        asset: cIDR(),
-        amount: amountIdr.toFixed(7),
-      }),
-    ),
-  );
-  // The visible row carries the real Stellar hash so it links on-chain; a hidden zero-amount
-  // marker keyed on the session guards against paying the merchant twice on a retry.
+  let res;
+  try {
+    res = await submit(userKp, (b) =>
+      b.addOperation(
+        Operation.payment({
+          destination: process.env.TREASURY_PUBLIC!,
+          asset: cIDR(),
+          amount: amountIdr.toFixed(7),
+        }),
+      ),
+    );
+  } catch (e) {
+    await releaseHash(payHash);
+    throw e;
+  }
+  // The visible row carries the real Stellar hash so it links on-chain (the payHash marker
+  // above is the hidden zero-amount idempotency guard).
   await recordTx(waNumber, "quickpay", info.merchantName, amountIdr, "out", res.hash);
-  await recordTx(waNumber, "quickpay", info.merchantName, 0, "out", payHash);
 
   let settlement: Settlement | { error: string } | null = null;
   if (xenditEnabled()) {
