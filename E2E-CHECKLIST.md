@@ -29,20 +29,37 @@ Checklist uji end-to-end setelah rombakan auth (tahap 1–5) dan redesign rupiah
 | 🔲 1.1 | Buka `castelpay.vercel.app/wallet` | Layar **"Welcome to Castel"**, meminta nomor WhatsApp |
 | 🔲 1.2 | Isi nomor (format `+628…`) → *Send code on WhatsApp* | Kode 6 digit **masuk ke WhatsApp** |
 | 🔲 1.3 | Masukkan kode **salah** | ❌ `wrong code` |
-| 🔲 1.4 | Masukkan kode **benar** | Masuk ke wallet |
+| 🔲 1.4 | Masukkan kode **benar** | **User baru:** langsung ke langkah **wajib** buat PIN (lihat §2), **bukan** wallet. **User lama:** masuk ke wallet |
 | 🔲 1.5 | Coba pakai kode yang **sama** lagi | ❌ ditolak — OTP sekali pakai |
 | 🔲 1.6 | Chat bot WhatsApp: `hi` | Menu muncul — **tanpa kata "USDC" atau "exchange"** |
 | 🔲 1.7 | Chat bot: `topup` → **tap link**-nya | Langsung masuk wallet + panel top-up terbuka (tanpa OTP lagi) |
 
 ---
 
-## 2. PIN — 🔲 manual
+## 2. PIN — wajib saat onboarding — 🔲 manual
+
+> 🎯 Buat PIN kini **wajib sebelum wallet bisa dipakai**. Setelah sign-in pertama, user baru mendarat di layar **"One last step"** yang memaksa buat PIN 6 digit — bukan wallet. Tanpa PIN, tidak ada transaksi.
 
 | # | Langkah | Harapan |
 |---|---|---|
-| 🔲 2.1 | Lihat wallet | Banner kuning **"Set your payment PIN"** |
-| 🔲 2.2 | Tap → isi PIN berbeda di dua kolom | ❌ *"PINs don't match"* |
-| 🔲 2.3 | Isi PIN sama (6 digit) | ✅ Banner hilang |
+| 🔲 2.1 | Setelah kode OTP benar (user baru) | 🎯 Layar wajib **"One last step"** meminta buat PIN 6 digit — **bukan** wallet |
+| 🔲 2.2 | Isi PIN lemah **`123456`** (berurutan) | ❌ ditolak — PIN mudah ditebak (`pinProblem`) |
+| 🔲 2.3 | Isi PIN lemah **`111111`** (angka sama) | ❌ ditolak — angka berulang |
+| 🔲 2.4 | Isi PIN berbeda di dua kolom | ❌ *"PINs don't match"* |
+| 🔲 2.5 | Isi PIN kuat & sama (6 digit) | ✅ Masuk ke wallet |
+
+### Lupa PIN — reset via link sekali-pakai di WhatsApp — 🔲 manual
+
+> 🎯 Reset PIN **tidak lewat support**. Link reset **dikirim lewat WhatsApp** dan **tidak pernah dikembalikan di respons API** — menerima link di WhatsApp itulah bukti kepemilikan nomor. Sekali pakai, berlaku 15 menit.
+
+| # | Langkah | Harapan |
+|---|---|---|
+| 🔲 2.6 | Salah PIN **5×** saat bayar | 🎯 Terkunci → diarahkan ke reset lupa PIN (kirim *forgot pin* di WhatsApp) |
+| 🔲 2.7 | Minta reset: `POST /me/pin/reset-link` (atau *forgot pin* ke bot) | Link **sekali-pakai, 15 menit** masuk **ke WhatsApp**; 🎯 **tidak** muncul di respons API |
+| 🔲 2.8 | Tap link → `/reset-pin?t=<token>` → isi PIN baru → submit (`POST /auth/pin/reset`) | ✅ PIN baru ter-set, dapat **sesi baru**; hash PIN lama dihapus |
+| 🔲 2.9 | Bayar QRIS pakai **PIN lama** | ❌ `wrong pin` — PIN lama tak berlaku; PIN baru berhasil |
+| 🔲 2.10 | Buka **link yang sama** lagi | ❌ ditolak — token **sekali pakai** |
+| 🔲 2.11 | Balas **`BLOCK`** ke notifikasi WhatsApp *"your PIN was changed"* | 🎯 Akun **frozen** — semua spend ditolak (*"account frozen — message the bot to unfreeze"*) sampai owner buka blokir lewat bot |
 
 ---
 
@@ -54,7 +71,7 @@ Checklist uji end-to-end setelah rombakan auth (tahap 1–5) dan redesign rupiah
 |---|---|---|
 | 🔲 3.1 | Tap **"+ Add money"** → isi `100` | Preview: **"You get Rp 1.6xx.xxx"** + **"vs money changer +Rp xx.xxx"** |
 | 🔲 3.2 | *Top up with card →* → kartu **4242 4242 4242 4242**, exp `12/34`, CVC `123` | Redirect kembali ke wallet |
-| 🔲 3.3 | Lihat saldo | 🎯 Saldo dalam **RUPIAH**. Toast: *"Rp 1.6xx.xxx added — Rp xx.xxx more than a money changer"* |
+| 🔲 3.3 | Lihat saldo | 🎯 Saldo dalam **RUPIAH**. **Kartu hasil** berwarna (bukan toast sekilas): *"Rp 1.6xx.xxx added — Rp xx.xxx more than a money changer"* |
 | 🔲 3.4 | Cek tidak ada USDC nyangkut | 🎯 Tidak ada baris *"USDC waiting to be exchanged"*. Tidak ada seksi *"Exchange to rupiah"* — kartu dikreditkan **langsung sebagai rupiah**, tidak ada saldo dolar yang bisa nyangkut |
 | 🔲 3.5 | Cek riwayat | `+Rp 1.6xx.xxx` (bukan `+$100`), ada link **"View on-chain ↗"** |
 | 🔲 3.6 | Tap link on-chain | Stellar Explorer menampilkan **penerbitan cIDR sungguhan** ke akun kamu (bukan path payment — kartu tidak lewat DEX) |
@@ -165,7 +182,7 @@ Checklist uji end-to-end setelah rombakan auth (tahap 1–5) dan redesign rupiah
 | | Jumlah | Status |
 |---|---|---|
 | Otomatis (security + plafon) | 13 | ✅ lulus di produksi |
-| Manual (browser / kartu / WhatsApp / wallet) | 39 | 🔲 menunggu |
+| Manual (browser / kartu / WhatsApp / wallet) | 47 | 🔲 menunggu |
 
 **Prioritaskan bagian 3** (kredit rupiah langsung dari kartu) **dan 3B** (on-ramp kripto lewat Freighter) — keduanya inti arsitektur saat ini. Selebihnya sudah pernah berjalan sebelum rombakan.
 

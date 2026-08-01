@@ -107,7 +107,7 @@ Nothing in the core flow is mocked.
 |---|---|
 | **QRIS** | Real EMVCo TLV parser — decodes live merchant QR codes |
 | **Card on-ramp** | **Stripe** Checkout, test mode — a real card, charged in USD; cIDR credited **directly at the live USD/IDR reference rate** (30 bps spread), no intermediate dollar balance |
-| **Crypto on-ramp** | **Stellar Wallets Kit** + **Freighter** — connect a wallet and deposit real **Circle testnet USDC** or **native XLM**; treasury takes it as reserve, cIDR issued at the reference rate (anchor-style) |
+| **Crypto on-ramp** | **Stellar Wallets Kit** + **Freighter** — connect a wallet and deposit real **Circle testnet USDC** or **native XLM**; treasury takes it as reserve, cIDR issued at the reference rate (anchor-style). The XLM tab shows a **live rupiah preview** as you type, from `GET /fx/xlm-quote` (XLM→USD via Coinbase → cIDR at the reference rate) |
 | **DEX / path payment** | **Stellar path payment** across the protocol's built-in order book — a real on-chain swap, priced against the **live USD/IDR rate**; powers the optional "exchange held USDC → rupiah" path |
 | **Merchant settlement** | **Xendit** Disbursement API, sandbox — a real IDR payout call |
 | **Cash-out** | **Soroban escrow** on testnet — hashlock, refund timelock, fee split, on-chain release |
@@ -156,8 +156,21 @@ The WhatsApp number is **identity, not authority**. A session comes from an HMAC
 server signed, obtainable only by proving control of the number — an OTP delivered over
 WhatsApp, or a signed magic link. No route reads a caller-supplied phone number.
 
-Spending requires a **6-digit PIN** (argon2, locked after 5 failures) that is never typed
-into a chat, so an attacker who takes over the victim's WhatsApp still cannot move money.
+Spending requires a **6-digit PIN** (argon2) that is never typed into a chat, so an attacker
+who takes over the victim's WhatsApp still cannot move money. Setting it is **mandatory
+onboarding**: a brand-new user's first sign-in lands not on the wallet but on a required
+"one last step" PIN screen, and weak PINs are rejected at set time — sequential runs
+(`123456`) and repeated digits (`111111`).
+
+A **forgotten PIN** is recovered without a support ticket: the user asks for a reset, and a
+**single-use, 15-minute link is delivered over WhatsApp** — never returned in an API
+response, so receiving it *is* the proof of number ownership. The link opens `/reset-pin` on
+the web wallet, which clears the old PIN hash and sets the new one. Five wrong PINs lock
+spending and route the user to that same forgot-PIN reset.
+
+An account can be **frozen**: the "your PIN was changed" WhatsApp alert can be answered
+`BLOCK`, after which every spend is refused until the owner messages the bot to unfreeze —
+a kill switch the attacker cannot reach because it lives in the chat, not the wallet.
 
 Tier 0 = **Simplified CDD**, enforced in code: a single transaction *and* a **rolling 30-day
 total** are both capped — FATF Rec. 16's de-minimis together with its aggregation rule,
@@ -209,6 +222,11 @@ bun install
 cp .env.example .env      # Stellar keys, Twilio, Stripe, Xendit, Neon Postgres
 bun run src/index.ts      # :3001
 ```
+
+> **Cold start.** The API runs on a free tier that sleeps when idle. Any page load pings it
+> to wake it, and the sign-in "Send code" button waits until the backend answers ("Waking the
+> server…") before requesting an OTP — so the first code arrives instantly instead of being
+> lost while the server boots.
 
 Bootstrap a fresh testnet environment:
 

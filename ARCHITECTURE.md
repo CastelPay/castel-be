@@ -79,17 +79,17 @@ flowchart TB
     subgraph BE["⚙️ castel-be · Hono + Bun"]
         direction TB
         subgraph BAuth["auth"]
-            Rauth["/auth/request · /verify · /exchange"]
-            Lauth["lib/auth — HMAC token · OTP · PIN (argon2)"]
+            Rauth["/auth/request · /verify · /exchange · /pin/reset"]
+            Lauth["lib/auth — HMAC token · OTP · PIN (argon2)<br/><i>mandatory onboarding · strength check · WhatsApp reset · freeze</i>"]
         end
         subgraph BMoney["money routes (requireAuth + PIN + Tier-0)"]
             Rdep["/deposit/create · /confirm · /charge"]
             Rcrypto["/deposit/circle/* · /deposit/xlm/convert"]
             Rquick["/pay/quick/create · /confirm"]
-            Rswap["/fx/swap · /fx/quote · /deposit/usdc/convert"]
+            Rswap["/fx/swap · /fx/quote · /fx/xlm-quote · /deposit/usdc/convert"]
             Rpay["/pay"]
             Rcash["/cashout/request · /redeem"]
-            Rme["/me/balance · /history · /limits"]
+            Rme["/me/balance · /history · /limits · /pin/reset-link"]
         end
         subgraph BLib["lib / services"]
             Lstellar["lib/stellar — Horizon · submit · seq-lock"]
@@ -182,6 +182,13 @@ flowchart TB
 
 - **Keys live only in the backend.** The tourist never holds a seed phrase; the web app
   never sees a secret. The phone number is identity, a signed token is authority.
+- **A PIN is mandatory before any spend.** A brand-new user's first sign-in lands on a
+  required PIN-creation step, not the wallet; weak PINs are rejected at set time. A forgotten
+  PIN is reset by `POST /me/pin/reset-link`, which delivers a **single-use, 15-minute link
+  over WhatsApp** (never in the API response) that `/reset-pin` redeems via
+  `POST /auth/pin/reset` — receiving it on WhatsApp is itself the proof of number ownership.
+  An owner can freeze the account (reply `BLOCK` to the PIN-change alert) to refuse every
+  spend until they unfreeze from the chat.
 - **The card form and the camera are the only reasons the web app exists** — a chat can do
   neither. Everything else is a WhatsApp message.
 - **Deposit credits rupiah directly.** A card top-up (and a connected wallet's USDC or
