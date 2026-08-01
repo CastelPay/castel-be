@@ -482,7 +482,7 @@ app.post("/deposit/create", requireAuth, async (c) => {
 app.post("/deposit/charge", requireAuth, async (c) => {
   if (!stripe) return c.json({ error: "stripe not configured" }, 500);
   const waNumber = c.get("wa");
-  const { usd } = await c.req.json();
+  const { usd, key } = await c.req.json();
   const amount = Number(usd);
   if (!amount || amount <= 0) return c.json({ error: "amount required" }, 400);
 
@@ -498,15 +498,20 @@ app.post("/deposit/charge", requireAuth, async (c) => {
 
   let intent: Stripe.PaymentIntent;
   try {
-    intent = await stripe.paymentIntents.create({
-      amount: Math.round(amount * 100),
-      currency: "usd",
-      customer: user.stripeCustomerId,
-      payment_method: card.id,
-      off_session: true,
-      confirm: true,
-      metadata: { waNumber, usd: String(amount) },
-    });
+    intent = await stripe.paymentIntents.create(
+      {
+        amount: Math.round(amount * 100),
+        currency: "usd",
+        customer: user.stripeCustomerId,
+        payment_method: card.id,
+        off_session: true,
+        confirm: true,
+        metadata: { waNumber, usd: String(amount) },
+      },
+      // A client key makes a retry reuse the SAME PaymentIntent instead of charging the card
+      // again if the first response was lost. (Idempotency keys expire after ~24h on Stripe.)
+      typeof key === "string" && key ? { idempotencyKey: `charge:${key}` } : undefined,
+    );
   } catch (e) {
     // A card that now needs re-authentication (SCA) can't be charged silently — fall back to Checkout.
     return c.json({ error: "card needs re-entry", useCheckout: true, detail: (e as Error).message }, 402);
@@ -915,7 +920,7 @@ app.post("/qris/decode", async (c) => {
 
 app.post("/pay", requireAuth, async (c) => {
   const waNumber = c.get("wa");
-  const { payload, amount, pin } = await c.req.json();
+  const { payload, amount, pin, key } = await c.req.json();
   const user = await walletUser(waNumber);
   if (!user) return c.json({ error: "not found" }, 404);
 
@@ -926,45 +931,65 @@ app.post("/pay", requireAuth, async (c) => {
   const amountIdr = info.amount ?? Number(amount);
   if (!amountIdr || amountIdr <= 0) return c.json({ error: "amount required" }, 400);
 
-  const limit = await checkSpendLimit(waNumber, amountIdr);
-  if (!limit.ok) return c.json({ error: limit.error }, 403);
+  // Idempotency: reserve the client key before submitting so a retry/double-tap can't pay the
+  // merchant twice. A repeat with the same key short-circuits to "already paid".
+  const guard = typeof key === "string" && key ? `pay:${key}` : null;
+  if (guard && !(await reserveHash(waNumber, "pay", info.merchantName, 0, "out", guard)))
+    return c.json({
+      merchant: info.merchantName,
+      city: info.city,
+      amountIdr,
+      alreadyPaid: true,
+      settlement: null,
+      balances: await walletBalances(user.publicKey),
+    });
 
-  const userKp = Keypair.fromSecret(user.secret);
-  const res = await submit(userKp, (b) =>
-    b.addOperation(
-      Operation.payment({
-        destination: process.env.TREASURY_PUBLIC!,
-        asset: cIDR(),
-        amount: amountIdr.toFixed(7),
-      }),
-    ),
-  );
-
-  await recordTx(waNumber, "pay", info.merchantName, amountIdr, "out", res.hash);
-
-  // Settle IDR to the merchant via Xendit sandbox. Non-fatal: the on-chain debit
-  // already succeeded, so a settlement error must not fail the payment.
-  let settlement: Settlement | { error: string } | null = null;
-  if (xenditEnabled()) {
-    try {
-      settlement = await settleToMerchant({
-        externalId: `castel-pay-${res.hash.slice(0, 24)}`,
-        amountIdr,
-        merchantName: info.merchantName,
-      });
-    } catch (e) {
-      settlement = { error: (e as Error).message };
+  try {
+    const limit = await checkSpendLimit(waNumber, amountIdr);
+    if (!limit.ok) {
+      if (guard) await releaseHash(guard);
+      return c.json({ error: limit.error }, 403);
     }
-  }
 
-  return c.json({
-    merchant: info.merchantName,
-    city: info.city,
-    amountIdr,
-    hash: res.hash,
-    settlement,
-    balances: await walletBalances(user.publicKey),
-  });
+    const userKp = Keypair.fromSecret(user.secret);
+    const res = await submit(userKp, (b) =>
+      b.addOperation(
+        Operation.payment({
+          destination: process.env.TREASURY_PUBLIC!,
+          asset: cIDR(),
+          amount: amountIdr.toFixed(7),
+        }),
+      ),
+    );
+    await recordTx(waNumber, "pay", info.merchantName, amountIdr, "out", res.hash);
+
+    // Settle IDR to the merchant via Xendit sandbox. Non-fatal (the on-chain debit already
+    // succeeded); a deterministic external_id keyed on the payment lets Xendit dedup a retry.
+    let settlement: Settlement | { error: string } | null = null;
+    if (xenditEnabled()) {
+      try {
+        settlement = await settleToMerchant({
+          externalId: `castel-pay-${(key ?? res.hash).replace(/[^a-zA-Z0-9]/g, "").slice(0, 28)}`,
+          amountIdr,
+          merchantName: info.merchantName,
+        });
+      } catch (e) {
+        settlement = { error: (e as Error).message };
+      }
+    }
+
+    return c.json({
+      merchant: info.merchantName,
+      city: info.city,
+      amountIdr,
+      hash: res.hash,
+      settlement,
+      balances: await walletBalances(user.publicKey),
+    });
+  } catch (e) {
+    if (guard) await releaseHash(guard);
+    throw e;
+  }
 });
 
 const CASHOUT_FEE_BPS = 100;

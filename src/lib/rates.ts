@@ -51,6 +51,9 @@ async function lastStored(): Promise<{ rate: number; at: number } | null> {
  */
 const XLM_SOURCE = "https://api.coinbase.com/v2/prices/XLM-USD/spot";
 const XLM_FALLBACK_USD = 0.12;
+// Past this age a cached rate is no longer trustworthy enough to price a deposit against — we
+// drop to the conservative fallback rather than crediting on a possibly-hours-stale number.
+const XLM_MAX_STALE_MS = 6 * 60 * 60_000;
 let xlmMemo: { rate: number; at: number } | null = null;
 
 export async function xlmUsd(): Promise<Mid> {
@@ -69,7 +72,8 @@ export async function xlmUsd(): Promise<Mid> {
   } catch {
     // fall through to the last known / fallback
   }
-  if (xlmMemo) return { rate: xlmMemo.rate, source: "cached", at: xlmMemo.at };
+  if (xlmMemo && Date.now() - xlmMemo.at < XLM_MAX_STALE_MS)
+    return { rate: xlmMemo.rate, source: "cached", at: xlmMemo.at };
   console.error("XLM/USD unavailable from Coinbase — quoting on the fallback rate");
   return { rate: XLM_FALLBACK_USD, source: "fallback", at: Date.now() };
 }
