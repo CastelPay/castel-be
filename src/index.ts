@@ -631,7 +631,9 @@ const XLM_SPREAD_BPS = 30;
 app.post("/deposit/xlm/prepare", requireAuth, async (c) => {
   const user = await walletUser(c.get("wa"));
   if (!user) return c.json({ error: "not found" }, 404);
-  return c.json({ destination: process.env.TREASURY_PUBLIC! });
+  // The wallet must stamp this MEMO_ID on the XLM payment so convert can bind it to THIS user —
+  // without it, anyone could claim any XLM that reached the treasury by submitting its hash.
+  return c.json({ destination: process.env.TREASURY_PUBLIC!, memo: String(user.id) });
 });
 
 app.post("/deposit/xlm/convert", requireAuth, async (c) => {
@@ -646,11 +648,18 @@ app.post("/deposit/xlm/convert", requireAuth, async (c) => {
   const already = (await db.select().from(transactions).where(eq(transactions.hash, hash)))[0];
   if (already) return c.json({ error: "this deposit was already credited" }, 409);
 
-  // Verify on-chain: the hash must carry a native-XLM payment into the treasury.
+  // Verify on-chain: the hash must carry a native-XLM payment into the treasury AND be tagged
+  // with this user's MEMO_ID (set by /deposit/xlm/prepare). The memo is what binds the payment
+  // to the caller — the `to` alone would let anyone claim any XLM the treasury ever received.
   const treasuryPub = process.env.TREASURY_PUBLIC!;
   let xlm = 0;
+  let memoOk = false;
   try {
-    const ops = await horizon.operations().forTransaction(hash).limit(50).call();
+    const [tx, ops] = await Promise.all([
+      horizon.transactions().transaction(hash).call(),
+      horizon.operations().forTransaction(hash).limit(50).call(),
+    ]);
+    memoOk = tx.memo_type === "id" && tx.memo === String(user.id);
     const pay = ops.records.find(
       (o: any) => o.type === "payment" && o.asset_type === "native" && o.to === treasuryPub,
     ) as any;
@@ -659,6 +668,11 @@ app.post("/deposit/xlm/convert", requireAuth, async (c) => {
     return c.json({ error: "couldn't find that transaction yet — try again in a moment" }, 400);
   }
   if (xlm <= 0) return c.json({ error: "no XLM payment to Castel found in that transaction" }, 400);
+  if (!memoOk)
+    return c.json(
+      { error: "this XLM payment isn't tagged to your account — deposit from the Castel app" },
+      403,
+    );
 
   const usdValue = xlm * (await xlmUsd()).rate;
   const mid = (await usdIdrMid()).rate;
