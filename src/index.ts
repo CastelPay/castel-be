@@ -195,6 +195,20 @@ async function reserveHash(
 const releaseHash = (hash: string) =>
   db.delete(transactions).where(eq(transactions.hash, hash)).catch(() => {});
 
+/**
+ * Serialize async work per key, in-process (single Render instance today). Used so two
+ * concurrent requests for the same account can't both read a balance and both act on it.
+ */
+const userLocks = new Map<string, Promise<unknown>>();
+function withUserLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const run = (userLocks.get(key) ?? Promise.resolve()).then(fn, fn);
+  userLocks.set(
+    key,
+    run.catch(() => {}),
+  );
+  return run;
+}
+
 app.get("/", (c) => c.json({ ok: true, service: "castel-be" }));
 
 const normalizeWa = (s: string) => s.trim().replace(/[^\d+]/g, "");
@@ -563,43 +577,48 @@ app.post("/deposit/circle/convert", requireAuth, async (c) => {
   const user = await findUser(waNumber);
   if (!user) return c.json({ error: "not found" }, 404);
 
-  const usdc = Number(await circleUsdcBalance(user.publicKey));
-  if (usdc <= 0)
-    return c.json({ error: "no USDC received yet — send USDC to your Castel address first" }, 400);
+  // Serialize per account so two concurrent converts can't both read the same USDC balance
+  // and both mint. Combined with sweep-before-issue below, the on-chain balance is itself the
+  // idempotency key: once swept it reads 0, so a retry can't double-mint.
+  return withUserLock(user.publicKey, async () => {
+    const usdc = Number(await circleUsdcBalance(user.publicKey));
+    if (usdc <= 0)
+      return c.json({ error: "no USDC received yet — send USDC to your Castel address first" }, 400);
 
-  const mid = (await usdIdrMid()).rate;
-  const cidrOut = Math.round((usdc * mid * (10_000 - CIRCLE_SPREAD_BPS)) / 10_000);
-  const savingsIdr = cidrOut - usdc * (mid - MONEY_CHANGER_MARKDOWN);
+    const mid = (await usdIdrMid()).rate;
+    const cidrOut = Math.round((usdc * mid * (10_000 - CIRCLE_SPREAD_BPS)) / 10_000);
+    const savingsIdr = cidrOut - usdc * (mid - MONEY_CHANGER_MARKDOWN);
 
-  const limit = await checkDepositLimit(waNumber, cidrOut);
-  if (!limit.ok) return c.json({ error: limit.error }, 403);
+    const limit = await checkDepositLimit(waNumber, cidrOut);
+    if (!limit.ok) return c.json({ error: limit.error }, 403);
 
-  // Issue cIDR to the user (distributor holds the cIDR float)...
-  const distributor = Keypair.fromSecret(process.env.DISTRIBUTOR_SECRET!);
-  await submit(distributor, (b) =>
-    b.addOperation(
-      Operation.payment({ destination: user.publicKey, asset: cIDR(), amount: cidrOut.toFixed(7) }),
-    ),
-  );
-  // ...and sweep the USDC into the treasury as the reserve backing it.
-  const sweep = await submit(Keypair.fromSecret(user.secret), (b) =>
-    b.addOperation(
-      Operation.payment({
-        destination: process.env.TREASURY_PUBLIC!,
-        asset: circleUSDC(),
-        amount: usdc.toFixed(7),
-      }),
-    ),
-  );
+    // Sweep the USDC into the treasury as the reserve FIRST — this zeroes the user's USDC
+    // balance, so any retry sees 0 and cannot double-mint. Then issue the matching cIDR.
+    const sweep = await submit(Keypair.fromSecret(user.secret), (b) =>
+      b.addOperation(
+        Operation.payment({
+          destination: process.env.TREASURY_PUBLIC!,
+          asset: circleUSDC(),
+          amount: usdc.toFixed(7),
+        }),
+      ),
+    );
+    const distributor = Keypair.fromSecret(process.env.DISTRIBUTOR_SECRET!);
+    await submit(distributor, (b) =>
+      b.addOperation(
+        Operation.payment({ destination: user.publicKey, asset: cIDR(), amount: cidrOut.toFixed(7) }),
+      ),
+    );
 
-  await recordTx(waNumber, "deposit", `Added ${rupiah(cidrOut)} (USDC)`, cidrOut, "in", sweep.hash);
-  return c.json({
-    credited: true,
-    usdc,
-    cidr: cidrOut,
-    savingsIdr,
-    hash: sweep.hash,
-    balances: await walletBalances(user.publicKey),
+    await recordTx(waNumber, "deposit", `Added ${rupiah(cidrOut)} (USDC)`, cidrOut, "in", sweep.hash);
+    return c.json({
+      credited: true,
+      usdc,
+      cidr: cidrOut,
+      savingsIdr,
+      hash: sweep.hash,
+      balances: await walletBalances(user.publicKey),
+    });
   });
 });
 
