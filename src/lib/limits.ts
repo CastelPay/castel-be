@@ -14,8 +14,17 @@ export const TIER0_TX_CAP_IDR = 16_500_000;
 export const TIER0_WINDOW_CAP_IDR = 16_500_000;
 export const WINDOW_MS = 30 * 24 * 60 * 60_000;
 
+// A "hold" is written when a Checkout session is created but not yet paid, so the limit counts
+// in-flight sessions and a user can't dodge the cap by opening many tabs at once. It counts for
+// only this long — an unconfirmed session past this is treated as abandoned (Stripe also expires
+// it), and the hold row is deleted the moment the session is confirmed.
+const HOLD_TTL_MS = 60 * 60_000;
+export const HOLD_DEPOSIT = "hold_deposit";
+export const HOLD_SPEND = "hold_spend";
+export const HOLD_TYPES = [HOLD_DEPOSIT, HOLD_SPEND];
+
 /** Every amount in the ledger is rupiah — deposits are converted before they are recorded. */
-async function sumSince(waNumber: string, types: string[]): Promise<number> {
+async function sumSince(waNumber: string, types: string[], windowMs = WINDOW_MS): Promise<number> {
   const [row] = await db
     .select({ total: sql<number>`coalesce(sum(${transactions.amountIdr}), 0)::bigint` })
     .from(transactions)
@@ -23,16 +32,20 @@ async function sumSince(waNumber: string, types: string[]): Promise<number> {
       and(
         eq(transactions.waNumber, waNumber),
         inArray(transactions.type, types),
-        gt(transactions.createdAt, Date.now() - WINDOW_MS),
+        gt(transactions.createdAt, Date.now() - windowMs),
       ),
     );
   return Number(row?.total ?? 0);
 }
 
-// "quickpay" is a merchant payment funded by a card per-bill; it counts toward the spend
-// window exactly like "pay", or the 30-day aggregation cap could be bypassed via that rail.
-export const spentIdr = (waNumber: string) => sumSince(waNumber, ["pay", "cashout", "quickpay"]);
-export const depositedIdr = (waNumber: string) => sumSince(waNumber, ["deposit"]);
+// "quickpay" is a merchant payment funded by a card per-bill; it counts toward the spend window
+// exactly like "pay", or the 30-day aggregation cap could be bypassed via that rail. Recent
+// unpaid holds count too, so parallel Checkout sessions can't collectively exceed the cap.
+export const spentIdr = async (waNumber: string) =>
+  (await sumSince(waNumber, ["pay", "cashout", "quickpay"])) +
+  (await sumSince(waNumber, [HOLD_SPEND], HOLD_TTL_MS));
+export const depositedIdr = async (waNumber: string) =>
+  (await sumSince(waNumber, ["deposit"])) + (await sumSince(waNumber, [HOLD_DEPOSIT], HOLD_TTL_MS));
 
 const rupiah = (n: number) => `Rp ${Math.round(n).toLocaleString("id-ID")}`;
 

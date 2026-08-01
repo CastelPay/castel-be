@@ -1,6 +1,6 @@
 import { Keypair, Operation } from "@stellar/stellar-sdk";
 import { timingSafeEqual } from "node:crypto";
-import { and, desc, eq, ne } from "drizzle-orm";
+import { and, desc, eq, ne, notInArray } from "drizzle-orm";
 import { type Context, Hono } from "hono";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
@@ -29,6 +29,9 @@ import {
 import {
   checkDepositLimit,
   checkSpendLimit,
+  HOLD_DEPOSIT,
+  HOLD_SPEND,
+  HOLD_TYPES,
   limitsFor,
   rateLimit,
 } from "./lib/limits";
@@ -194,6 +197,17 @@ async function reserveHash(
 
 const releaseHash = (hash: string) =>
   db.delete(transactions).where(eq(transactions.hash, hash)).catch(() => {});
+
+// A hold reserves limit headroom for an unpaid Checkout session (see limits.ts). Placed at
+// create, deleted at confirm, and ignored by the cap after HOLD_TTL if the session is abandoned.
+const placeHold = (
+  waNumber: string,
+  type: string,
+  amountIdr: number,
+  direction: "in" | "out",
+  sessionId: string,
+) => recordTx(waNumber, type, "Pending", amountIdr, direction, `hold:${sessionId}`);
+const releaseHold = (sessionId: string) => releaseHash(`hold:${sessionId}`);
 
 /**
  * Serialize async work per key, in-process (single Render instance today). Used so two
@@ -429,34 +443,39 @@ app.post("/deposit/create", requireAuth, async (c) => {
   // Card money is credited at the reference rate (see creditUsdAsRupiah), so the tier limit
   // is measured against that — no DEX quote, no liquidity error before the user even pays.
   const cidrOut = refCidr(amount, (await usdIdrMid()).rate);
-  const limit = await checkDepositLimit(waNumber, cidrOut);
-  if (!limit.ok) return c.json({ error: limit.error }, 403);
 
-  // Save the card to a reusable customer so later top-ups need no card entry (see /deposit/charge).
-  const customer = await stripeCustomerFor(user);
-  const session = await stripe.checkout.sessions.create({
-    mode: "payment",
-    customer,
-    payment_intent_data: { setup_future_usage: "off_session" },
-    line_items: [
-      {
-        quantity: 1,
-        price_data: {
-          currency: "usd",
-          unit_amount: Math.round(amount * 100),
-          product_data: {
-            name: "Castel top-up",
-            description: `Adds about ${rupiah(cidrOut)} to your Castel balance`,
+  // Serialize per user so parallel Checkout sessions can't collectively exceed the tier cap:
+  // check the limit (which counts existing holds) and place this session's hold atomically.
+  return withUserLock(waNumber, async () => {
+    const limit = await checkDepositLimit(waNumber, cidrOut);
+    if (!limit.ok) return c.json({ error: limit.error }, 403);
+
+    // Save the card to a reusable customer so later top-ups need no card entry (/deposit/charge).
+    const customer = await stripeCustomerFor(user);
+    const session = await stripe!.checkout.sessions.create({
+      mode: "payment",
+      customer,
+      payment_intent_data: { setup_future_usage: "off_session" },
+      line_items: [
+        {
+          quantity: 1,
+          price_data: {
+            currency: "usd",
+            unit_amount: Math.round(amount * 100),
+            product_data: {
+              name: "Castel top-up",
+              description: `Adds about ${rupiah(cidrOut)} to your Castel balance`,
+            },
           },
         },
-      },
-    ],
-    success_url: `${WEB}/wallet?deposit={CHECKOUT_SESSION_ID}`,
-    cancel_url: `${WEB}/wallet?deposit=cancel`,
-    metadata: { waNumber, usd: String(amount) },
+      ],
+      success_url: `${WEB}/wallet?deposit={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${WEB}/wallet?deposit=cancel`,
+      metadata: { waNumber, usd: String(amount) },
+    });
+    await placeHold(waNumber, HOLD_DEPOSIT, cidrOut, "in", session.id);
+    return c.json({ url: session.url });
   });
-
-  return c.json({ url: session.url });
 });
 
 // One-tap top-up once a card is on file: charge the saved card off-session, no redirect.
@@ -512,6 +531,9 @@ app.post("/deposit/confirm", requireAuth, async (c) => {
 
   const user = await findUser(waNumber);
   if (!user) return c.json({ error: "not found" }, 404);
+
+  // The session is paid: its limit hold has done its job — the real deposit row now counts.
+  await releaseHold(sessionId);
 
   // Remember the customer so subsequent top-ups can reuse the card Checkout just saved.
   if (session.customer && !user.stripeCustomerId) {
@@ -724,39 +746,50 @@ app.post("/pay/quick/create", requireAuth, async (c) => {
   const amountIdr = info.amount ?? Number(amount);
   if (!amountIdr || amountIdr <= 0) return c.json({ error: "amount required" }, 400);
 
-  const spend = await checkSpendLimit(waNumber, amountIdr);
-  if (!spend.ok) return c.json({ error: spend.error }, 403);
-
   // Size the charge off the reference rate the card credit executes at (see creditUsdAsRupiah),
   // over-funded by the buffer so rounding can't leave the bill short. No DEX dependency.
   const mid = (await usdIdrMid()).rate;
   const refRate = (mid * (10_000 - REFERENCE_SPREAD_BPS)) / 10_000;
   const usd = Math.ceil((amountIdr / refRate) * (1 + QUICKPAY_BUFFER) * 100) / 100;
 
-  const dep = await checkDepositLimit(waNumber, amountIdr);
-  if (!dep.ok) return c.json({ error: dep.error }, 403);
+  // Serialize per user so parallel quick-pay sessions can't collectively exceed the tier caps:
+  // check the spend + deposit limits (counting holds) and place this session's hold atomically.
+  return withUserLock(waNumber, async () => {
+    const spend = await checkSpendLimit(waNumber, amountIdr);
+    if (!spend.ok) return c.json({ error: spend.error }, 403);
+    const dep = await checkDepositLimit(waNumber, amountIdr);
+    if (!dep.ok) return c.json({ error: dep.error }, 403);
 
-  const session = await stripe.checkout.sessions.create({
-    mode: "payment",
-    line_items: [
-      {
-        quantity: 1,
-        price_data: {
-          currency: "usd",
-          unit_amount: Math.round(usd * 100),
-          product_data: {
-            name: `Pay ${info.merchantName}`,
-            description: `${rupiah(amountIdr)} at ${info.merchantName}`,
+    const session = await stripe!.checkout.sessions.create({
+      mode: "payment",
+      line_items: [
+        {
+          quantity: 1,
+          price_data: {
+            currency: "usd",
+            unit_amount: Math.round(usd * 100),
+            product_data: {
+              name: `Pay ${info.merchantName}`,
+              description: `${rupiah(amountIdr)} at ${info.merchantName}`,
+            },
           },
         },
+      ],
+      success_url: `${WEB}/pay?quick={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${WEB}/pay?quick=cancel`,
+      // Lock the create-time rate into the session so confirm credits at the SAME rate the charge
+      // was sized against — otherwise a rate move before confirm could under-fund the bill.
+      metadata: {
+        waNumber,
+        usd: String(usd),
+        mid: String(mid),
+        quickPayload: String(payload),
+        quickAmountIdr: String(amountIdr),
       },
-    ],
-    success_url: `${WEB}/pay?quick={CHECKOUT_SESSION_ID}`,
-    cancel_url: `${WEB}/pay?quick=cancel`,
-    metadata: { waNumber, usd: String(usd), quickPayload: String(payload), quickAmountIdr: String(amountIdr) },
+    });
+    await placeHold(waNumber, HOLD_SPEND, amountIdr, "out", session.id);
+    return c.json({ url: session.url, usd, amountIdr });
   });
-
-  return c.json({ url: session.url, usd, amountIdr });
 });
 
 app.post("/pay/quick/confirm", requireAuth, async (c) => {
@@ -774,19 +807,36 @@ app.post("/pay/quick/confirm", requireAuth, async (c) => {
   const user = await walletUser(waNumber);
   if (!user) return c.json({ error: "not found" }, 404);
 
+  // The session is paid: its limit hold has done its job — the real quickpay row now counts.
+  await releaseHold(sessionId);
+
   const usd = Number(session.metadata?.usd ?? 0);
   const payload = String(session.metadata?.quickPayload ?? "");
   const amountIdr = Number(session.metadata?.quickAmountIdr ?? 0);
   const info = parseQris(payload);
   const userKp = Keypair.fromSecret(user.secret);
 
+  // Deterministic per-session settlement id: Xendit dedups on external_id, so re-attempting the
+  // settlement (e.g. on an alreadyPaid retry after a first failure) never double-disburses.
+  const externalId = `castel-quick-${sessionId.replace(/[^a-zA-Z0-9]/g, "").slice(0, 28)}`;
+  const settle = async (): Promise<Settlement | { error: string } | null> => {
+    if (!xenditEnabled()) return null;
+    try {
+      return await settleToMerchant({ externalId, amountIdr, merchantName: info.merchantName });
+    } catch (e) {
+      return { error: (e as Error).message };
+    }
+  };
+
   // The card-charge leg: reserve the session marker BEFORE minting so a concurrent redirect
   // (two tabs / a retry) can't issue cIDR twice for one card charge.
   if (await reserveHash(waNumber, "deposit", `Card charge · ${info.merchantName}`, 0, "in", sessionId)) {
     try {
       // Direct-rupiah: the card money is the reserve, so issue cIDR straight to the user at the
-      // reference rate — no USDC minted, no DEX swap that a thin book could fail.
-      const cidrOut = refCidr(usd, (await usdIdrMid()).rate);
+      // rate locked in at create (falling back to the live mid for older sessions) — so the
+      // credited cIDR always covers the bill the charge was sized for.
+      const lockedMid = Number(session.metadata?.mid) || (await usdIdrMid()).rate;
+      const cidrOut = refCidr(usd, lockedMid);
       const distributor = Keypair.fromSecret(process.env.DISTRIBUTOR_SECRET!);
       await submit(distributor, (b) =>
         b.addOperation(
@@ -808,7 +858,8 @@ app.post("/pay/quick/confirm", requireAuth, async (c) => {
       city: info.city,
       amountIdr,
       alreadyPaid: true,
-      settlement: null,
+      // Re-attempt settlement in case the first confirm paid on-chain but the disbursement failed.
+      settlement: await settle(),
       balances: await walletBalances(user.publicKey),
     });
   }
@@ -832,25 +883,12 @@ app.post("/pay/quick/confirm", requireAuth, async (c) => {
   // above is the hidden zero-amount idempotency guard).
   await recordTx(waNumber, "quickpay", info.merchantName, amountIdr, "out", res.hash);
 
-  let settlement: Settlement | { error: string } | null = null;
-  if (xenditEnabled()) {
-    try {
-      settlement = await settleToMerchant({
-        externalId: `castel-pay-${res.hash.slice(0, 24)}`,
-        amountIdr,
-        merchantName: info.merchantName,
-      });
-    } catch (e) {
-      settlement = { error: (e as Error).message };
-    }
-  }
-
   return c.json({
     merchant: info.merchantName,
     city: info.city,
     amountIdr,
     hash: res.hash,
-    settlement,
+    settlement: await settle(),
     balances: await walletBalances(user.publicKey),
   });
 });
@@ -1018,7 +1056,13 @@ app.get("/me/history", requireAuth, async (c) => {
   const rows = await db
     .select()
     .from(transactions)
-    .where(and(eq(transactions.waNumber, c.get("wa")), ne(transactions.amountIdr, 0)))
+    .where(
+      and(
+        eq(transactions.waNumber, c.get("wa")),
+        ne(transactions.amountIdr, 0),
+        notInArray(transactions.type, HOLD_TYPES),
+      ),
+    )
     .orderBy(desc(transactions.createdAt))
     .limit(25);
   return c.json(rows);
