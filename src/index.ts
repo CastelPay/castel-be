@@ -1,6 +1,6 @@
 import { Keypair, Operation } from "@stellar/stellar-sdk";
 import { timingSafeEqual } from "node:crypto";
-import { and, desc, eq, ne, notInArray } from "drizzle-orm";
+import { and, desc, eq, ne, notInArray, sql } from "drizzle-orm";
 import { type Context, Hono } from "hono";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
@@ -18,10 +18,13 @@ import {
   MAX_OTP_ATTEMPTS,
   MAX_PIN_ATTEMPTS,
   OTP_TTL_MS,
+  PIN_RESET_TTL_MS,
+  pinProblem,
   requireAuth,
   SESSION_TTL_MS,
   signToken,
   throttleOtp,
+  throttleSend,
   type Vars,
   verifySecret,
   verifyToken,
@@ -68,7 +71,18 @@ app.use("/auth/*", async (c, next) => {
   await next();
 });
 
-for (const path of ["/pay", "/pay/*", "/cashout/request", "/fx/swap", "/deposit/*", "/fund"]) {
+// `/me/pin/*` is in here because it reaches Twilio (the reset link) and guards spending —
+// the same two reasons the rest of this list is throttled.
+for (const path of [
+  "/pay",
+  "/pay/*",
+  "/cashout/request",
+  "/fx/swap",
+  "/deposit/*",
+  "/fund",
+  "/me/pin",
+  "/me/pin/*",
+]) {
   app.use(path, async (c, next) => {
     const who = c.req.header("Authorization") ?? clientIp(c);
     if (!rateLimit("money:" + who, 20, 60_000))
@@ -131,15 +145,25 @@ async function walletUser(waNumber: string): Promise<User | null> {
 
 /** Spending needs the PIN — a hijacked WhatsApp session must not be able to move money. */
 async function checkPin(user: User, pin: unknown): Promise<string | null> {
+  if (user.frozen) return "account frozen — message the bot to unfreeze";
   if (!user.pinHash) return "pin not set";
-  if (user.pinAttempts >= MAX_PIN_ATTEMPTS) return "pin locked";
+  if (user.pinAttempts >= MAX_PIN_ATTEMPTS)
+    return "pin locked — send *forgot pin* on WhatsApp to set a new one";
   if (!pin) return "pin required";
   if (!(await verifySecret(String(pin), user.pinHash))) {
-    await db
+    // Increment in SQL, not from the row we read: two wrong guesses racing would otherwise
+    // both write the same number and quietly hand out more than MAX_PIN_ATTEMPTS tries.
+    const [row] = await db
       .update(users)
-      .set({ pinAttempts: user.pinAttempts + 1 })
-      .where(eq(users.id, user.id));
-    return "wrong pin";
+      .set({ pinAttempts: sql`${users.pinAttempts} + 1` })
+      .where(eq(users.id, user.id))
+      .returning({ attempts: users.pinAttempts });
+    const left = Math.max(0, MAX_PIN_ATTEMPTS - (row?.attempts ?? user.pinAttempts + 1));
+    // Say how many are left: without it the lock arrives with no warning, and the account
+    // is stuck behind a reset the user didn't know they were one wrong guess away from.
+    return left > 0
+      ? `wrong pin — ${left} ${left === 1 ? "try" : "tries"} left`
+      : "pin locked — send *forgot pin* on WhatsApp to set a new one";
   }
   if (user.pinAttempts > 0) {
     await db.update(users).set({ pinAttempts: 0 }).where(eq(users.id, user.id));
@@ -308,15 +332,104 @@ app.get("/me", requireAuth, async (c) => {
 
 app.post("/me/pin", requireAuth, async (c) => {
   const { pin } = await c.req.json();
-  if (!/^\d{6}$/.test(String(pin ?? ""))) return c.json({ error: "pin must be 6 digits" }, 400);
+  const bad = pinProblem(String(pin ?? ""));
+  if (bad) return c.json({ error: bad }, 400);
   const user = await findUser(c.get("wa"));
   if (!user) return c.json({ error: "not found" }, 404);
+  // Changing an existing PIN goes through the WhatsApp reset link, never through a live
+  // session — a stolen session must not be able to swap the credential that guards spending.
   if (user.pinHash) return c.json({ error: "pin already set" }, 409);
   await db
     .update(users)
-    .set({ pinHash: await hashSecret(String(pin)), pinAttempts: 0 })
+    .set({ pinHash: await hashSecret(String(pin)), pinAttempts: 0, pinChangedAt: Date.now() })
     .where(eq(users.id, user.id));
   return c.json({ ok: true });
+});
+
+/**
+ * Forgot-PIN, step 1: mail a single-use reset link to the number itself. Only the owner of
+ * the WhatsApp account receives it, which is the same proof of ownership the OTP gives — so
+ * this is deliberately NOT reachable with a session token alone (see the note in SECURITY.md
+ * about what a WhatsApp takeover does and does not get you).
+ */
+async function sendPinResetLink(waNumber: string): Promise<{ sent: boolean; error?: string }> {
+  const user = await findUser(waNumber);
+  if (!user) return { sent: false, error: "not found" };
+  if (!throttleSend("pinreset:" + waNumber))
+    return { sent: false, error: "please wait before asking for another reset link" };
+
+  // The token is signed AND its hash is stored: the signature bounds its lifetime, the stored
+  // hash is what redeeming clears, making the link good exactly once.
+  const token = signToken(waNumber, "pinreset", PIN_RESET_TTL_MS);
+  await db
+    .update(users)
+    .set({ pinResetHash: await hashSecret(token), pinResetExpires: Date.now() + PIN_RESET_TTL_MS })
+    .where(eq(users.id, user.id));
+
+  const url = `${WEB}/reset-pin?t=${token}`;
+  const sent = await sendWa(
+    "whatsapp:" + waNumber,
+    `🔑 Reset your Castel PIN\n${url}\n\nThe link works once and expires in 15 minutes. If you didn't ask for this, ignore it — your PIN hasn't changed.`,
+  );
+  if (!sent && process.env.LOG_OTP === "true") {
+    console.log(`[dev] PIN reset link for ${waNumber}: ${url}`);
+    return { sent: true };
+  }
+  return sent ? { sent: true } : { sent: false, error: "couldn't reach that number on WhatsApp" };
+}
+
+// Triggered from the web ("Forgot PIN?"), which knows the number from the session. The link
+// still goes to WhatsApp — the session only says which number to send it to.
+app.post("/me/pin/reset-link", requireAuth, async (c) => {
+  const res = await sendPinResetLink(c.get("wa"));
+  return res.sent ? c.json({ sent: true }) : c.json({ error: res.error }, 429);
+});
+
+/**
+ * Forgot-PIN, step 2: redeem the link. The token IS the authorisation, so no session is
+ * required — the user is typically locked out and may be on a fresh device. Redeeming also
+ * clears the attempt counter, which is what makes a locked PIN recoverable at all.
+ */
+app.post("/auth/pin/reset", async (c) => {
+  const { token, pin } = await c.req.json();
+  const wa = token ? verifyToken(String(token), "pinreset") : null;
+  if (!wa) return c.json({ error: "this reset link is invalid or has expired" }, 401);
+
+  const bad = pinProblem(String(pin ?? ""));
+  if (bad) return c.json({ error: bad }, 400);
+
+  const user = await findUser(wa);
+  if (!user?.pinResetHash || !user.pinResetExpires)
+    return c.json({ error: "this reset link has already been used" }, 401);
+  if (user.pinResetExpires < Date.now())
+    return c.json({ error: "this reset link has expired — ask for a new one" }, 401);
+  if (!(await verifySecret(String(token), user.pinResetHash)))
+    return c.json({ error: "this reset link has already been used" }, 401);
+
+  await db
+    .update(users)
+    .set({
+      pinHash: await hashSecret(String(pin)),
+      pinAttempts: 0,
+      pinChangedAt: Date.now(),
+      pinResetHash: null,
+      pinResetExpires: null,
+    })
+    .where(eq(users.id, user.id));
+
+  // Tell the number its PIN changed and give it a one-word way to stop the damage. A
+  // takeover that got as far as the reset link is loud from here on, not silent.
+  void sendWa(
+    "whatsapp:" + wa,
+    `🔐 Your Castel PIN was just changed.\n\nIf that wasn't you, reply *BLOCK* now — it freezes spending on your account immediately.`,
+  ).catch(() => {});
+
+  return c.json({
+    token: signToken(wa, "session", SESSION_TTL_MS),
+    waNumber: wa,
+    publicKey: user.publicKey,
+    hasPin: true,
+  });
 });
 
 app.get("/me/limits", requireAuth, async (c) => c.json(await limitsFor(c.get("wa"))));
@@ -350,6 +463,16 @@ app.get("/fx/quote", async (c) => {
   if (!usdc) return c.json({ error: "usdc query param required" }, 400);
   const mid = await usdIdrMid();
   return c.json(buildQuote(usdc, refCidr(usdc, mid.rate), mid));
+});
+
+// Rupiah preview for a native-XLM deposit: XLM → USD (Coinbase spot) → cIDR at the reference
+// rate. Same shape as /fx/quote so the wallet renders it exactly like the card/USDC preview.
+app.get("/fx/xlm-quote", async (c) => {
+  const xlm = Number(c.req.query("xlm") ?? "0");
+  if (!xlm) return c.json({ error: "xlm query param required" }, 400);
+  const usdValue = xlm * (await xlmUsd()).rate;
+  const mid = await usdIdrMid();
+  return c.json(buildQuote(usdValue, refCidr(usdValue, mid.rate), mid));
 });
 
 // Testnet demo faucet. Anyone can self-register a WhatsApp number, so without the
@@ -1127,7 +1250,27 @@ async function botReply(waNumber: string, message: string): Promise<string> {
     return m ? Number(m[1].replace(/[.,]/g, "")) : null;
   };
 
-  await ensureUser(waNumber);
+  const user = await ensureUser(waNumber);
+
+  // Checked before everything else: a frozen account is exactly the case where the person
+  // typing may not be the owner, so nothing else should answer until it's resolved.
+  if (/^(unfreeze|unblock|buka blokir)/.test(t)) {
+    if (!user.frozen) return "Your account isn't frozen.";
+    await db.update(users).set({ frozen: false }).where(eq(users.id, user.id));
+    return "✅ Spending is unfrozen. If you haven't already, send *forgot pin* to set a PIN only you know.";
+  }
+  if (/^(block|blokir|freeze)/.test(t)) {
+    await db.update(users).set({ frozen: true }).where(eq(users.id, user.id));
+    return "🛑 Spending is frozen. Nobody can pay or withdraw from this account.\n\nSend *forgot pin* to set a new PIN, then *unfreeze* when you're ready.";
+  }
+  if (/^(forgot|lupa|reset)/.test(t)) {
+    const res = await sendPinResetLink(waNumber);
+    return res.sent
+      ? "🔑 Sent you a reset link — it works once and expires in 15 minutes."
+      : `⚠️ ${res.error}`;
+  }
+  if (user.frozen)
+    return "🛑 This account is frozen. Send *forgot pin* to set a new PIN, then *unfreeze*.";
 
   if (t.startsWith("bal")) {
     const b = await internal("/me/balance", undefined, waNumber);
@@ -1151,7 +1294,7 @@ async function botReply(waNumber: string, message: string): Promise<string> {
   if (t.startsWith("cash") || t.startsWith("withdraw")) {
     return `💵 Tap to get cash at a Castel agent:\n${link("/cashout")}`;
   }
-  return `👋 Welcome to *Castel* — fair-rate rupiah for Bali, no bank needed.\n\nTry:\n• *balance* — see your rupiah\n• *topup* — add rupiah with your card\n• *pay* — scan & pay any QRIS merchant\n• *cash* — withdraw cash at an agent`;
+  return `👋 Welcome to *Castel* — fair-rate rupiah for Bali, no bank needed.\n\nTry:\n• *balance* — see your rupiah\n• *topup* — add rupiah with your card\n• *pay* — scan & pay any QRIS merchant\n• *cash* — withdraw cash at an agent\n• *forgot pin* — set a new payment PIN`;
 }
 
 const twilioClient =
